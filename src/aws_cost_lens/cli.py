@@ -26,7 +26,10 @@ def parse_args():
     parser.add_argument(
         "--service",
         default=None,
-        help="Filter by specific AWS service (e.g., cloudwatch, AmazonCloudWatch, s3, ec2). If not specified, all services will be shown.",
+        help=(
+            "Filter by specific AWS service (e.g., cloudwatch, AmazonCloudWatch, s3, ec2). "
+            "If not specified, all services will be shown."
+        ),
     )
     parser.add_argument(
         "--group-by",
@@ -70,9 +73,7 @@ def parse_args():
         default="MONTHLY",
         help="Time granularity for the cost analysis (HOURLY only works for the last 14 days)",
     )
-    parser.add_argument(
-        "--version", action="store_true", help="Show version information and exit"
-    )
+    parser.add_argument("--version", action="store_true", help="Show version information and exit")
     return parser.parse_args()
 
 
@@ -80,10 +81,11 @@ def main():
     """Main entry point for the CLI."""
     try:
         args = parse_args()
-        
+
         # Show version if requested
         if args.version:
             from aws_cost_lens import __version__
+
             print(f"AWS Cost Lens version {__version__}")
             return 0
 
@@ -110,19 +112,30 @@ def main():
         # Use detailed view if requested, otherwise use simple view as default
         if args.detailed:
             analyze_costs_detailed(
-                start_date, end_date, service, args.top, args.region, args.show_all, args.granularity
+                start_date=start_date,
+                end_date=end_date,
+                service=service,
+                top=args.top,
+                region=args.region,
+                show_all=args.show_all,
+                granularity=args.granularity,
             )
         else:
             analyze_costs_simple(
-                start_date, end_date, service, args.top, args.show_all, args.granularity
+                start_date=start_date,
+                end_date=end_date,
+                service=service,
+                top=args.top,
+                show_all=args.show_all,
+                granularity=args.granularity,
             )
-        
+
         return 0
     except KeyboardInterrupt:
         print("\nOperation cancelled by user")
         return 1
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error: {e!s}")
         return 1
 
 
@@ -133,4 +146,4 @@ def entry_point():
 
 
 if __name__ == "__main__":
-    entry_point() 
+    entry_point()

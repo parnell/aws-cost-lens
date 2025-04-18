@@ -7,4 +7,4 @@ build:: format
 	uv build
 
 publish:: build
-	uv publish --token $PYPI_API_TOKEN
+	sh -c 'uv publish --token "$$PYPI_API_TOKEN"'

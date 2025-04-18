@@ -7,13 +7,16 @@ Core functionality for displaying AWS costs by service and usage type with rich 
 import sys
 from datetime import datetime
 from enum import Enum
-from typing import NamedTuple
+from typing import NamedTuple, Union, Optional
 
 import boto3
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress
 from rich.table import Table
+
+# AWS Cost Explorer limits
+MAX_HOURLY_GRANULARITY_DAYS = 14
 
 
 class ServiceInfo(NamedTuple):
@@ -80,7 +83,7 @@ class AWSService(Enum):
         return name
 
     @classmethod
-    def get_alias(cls, service_name: str) -> str | None:
+    def get_alias(cls, service_name: str) -> Optional[str]:
         """Get a human-friendly alias for an AWS service name."""
         for service in cls:
             if service.aws_name == service_name and service.aliases:
@@ -91,8 +94,8 @@ class AWSService(Enum):
 def get_cost_data(
     start_date: str,
     end_date: str,
-    service: str | None,
-    group_by: str | list[str],
+    service: Optional[str],
+    group_by: Union[str, list[str]],
     granularity: str = "MONTHLY",
 ) -> dict:
     """Fetch cost data from AWS Cost Explorer API."""
@@ -120,9 +123,13 @@ def get_cost_data(
                 today = datetime.now()
                 days_from_today_start = (today - start_datetime).days
 
-                if days_diff > 14 or days_from_today_start > 14:
+                if (
+                    days_diff > MAX_HOURLY_GRANULARITY_DAYS
+                    or days_from_today_start > MAX_HOURLY_GRANULARITY_DAYS
+                ):
                     console.print(
-                        "[yellow]Warning: HOURLY granularity is only available for the past 14 days.[/yellow]"
+                        f"[yellow]Warning: HOURLY granularity is only available for the past "
+                        f"{MAX_HOURLY_GRANULARITY_DAYS} days.[/yellow]"
                     )
                     console.print("[yellow]Falling back to DAILY granularity.[/yellow]")
                     granularity = "DAILY"
@@ -149,9 +156,7 @@ def get_cost_data(
             if isinstance(group_by, str):
                 request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": group_by}]
             else:
-                request_params["GroupBy"] = [
-                    {"Type": "DIMENSION", "Key": key} for key in group_by
-                ]
+                request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": key} for key in group_by]
 
             # Add service filter if specified
             if service:
@@ -168,7 +173,7 @@ def get_cost_data(
 
         except Exception as e:
             progress.stop()
-            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            console.print(f"[bold red]Error:[/bold red] {e!s}")
             sys.exit(1)
 
 
@@ -225,7 +230,7 @@ def list_available_services(start_date: str, end_date: str) -> None:
 
         except Exception as e:
             progress.stop()
-            console.print(f"[bold red]Error:[/bold red] {str(e)}")
+            console.print(f"[bold red]Error:[/bold red] {e!s}")
             sys.exit(1)
 
 
@@ -298,7 +303,11 @@ def create_cost_table(
     if show_all or zero_count == 0:
         title = f"{title_prefix} {period_display} Costs"
     else:
-        title = f"{title_prefix} {period_display} Costs [dim]• Showing {non_zero_count} of {total_count} items (hidden: {zero_count} zero-cost items)[/dim]"
+        title = (
+            f"{title_prefix} {period_display} Costs "
+            f"[dim]• Showing {non_zero_count} of {total_count} items "
+            f"(hidden: {zero_count} zero-cost items)[/dim]"
+        )
 
     table = Table(title=title, expand=True)
     table.add_column(group_title, style="cyan")
@@ -339,9 +348,10 @@ def create_cost_table(
 
         # For items that are a fraction of max cost, add percentage label
         if max_cost > 0:
+            MAX_PERCENTAGE = 100
             percentage = (amount / max_cost) * 100
             # Only add percentage if not 100%
-            if percentage < 100:
+            if percentage < MAX_PERCENTAGE:
                 bar = f"{bar} {percentage:.1f}%"
             else:
                 bar = f"{bar} (max)"
@@ -354,13 +364,9 @@ def create_cost_table(
 
     # Add caption explaining the distribution
     if table.caption:
-        table.caption += (
-            "\nDistribution bars show relative cost compared to the highest item"
-        )
+        table.caption += "\nDistribution bars show relative cost compared to the highest item"
     else:
-        table.caption = (
-            "Distribution bars show relative cost compared to the highest item"
-        )
+        table.caption = "Distribution bars show relative cost compared to the highest item"
 
     return table
 
@@ -368,7 +374,7 @@ def create_cost_table(
 def analyze_costs_detailed(
     start_date: str,
     end_date: str,
-    service: str | None,
+    service: Optional[str],
     top: int,
     show_region: bool,
     show_all: bool,
@@ -394,9 +400,7 @@ def analyze_costs_detailed(
     console.print("\n[bold]Analyzing by USAGE_TYPE with SERVICE information[/bold]")
 
     # Get cost data with both SERVICE and USAGE_TYPE groupings
-    cost_data = get_cost_data(
-        start_date, end_date, service, ["SERVICE", "USAGE_TYPE"], granularity
-    )
+    cost_data = get_cost_data(start_date, end_date, service, ["SERVICE", "USAGE_TYPE"], granularity)
 
     # Check if we got any data
     has_data = False
@@ -434,7 +438,11 @@ def analyze_costs_detailed(
         if show_all or zero_count == 0:
             title = f"{month_display} Costs"
         else:
-            title = f"{month_display} Costs [dim]• Showing {non_zero_count} of {total_count} items (hidden: {zero_count} zero-cost items)[/dim]"
+            title = (
+                f"{month_display} Costs "
+                f"[dim]• Showing {non_zero_count} of {total_count} items "
+                f"(hidden: {zero_count} zero-cost items)[/dim]"
+            )
 
         table = Table(title=title, expand=True)
         table.add_column("Service", style="cyan")
@@ -481,25 +489,19 @@ def analyze_costs_detailed(
             table.add_row(service_name, usage_type, f"${amount:.2f}", bar)
 
         # Add caption explaining the distribution
-        table.caption = (
-            "Distribution bars show relative cost compared to the highest item"
-        )
+        table.caption = "Distribution bars show relative cost compared to the highest item"
 
         console.print(table)
 
     # If region breakdown is requested, add that too
     if show_region:
         console.print("\n[bold]Analyzing by REGION[/bold]")
-        region_data = get_cost_data(
-            start_date, end_date, service, "REGION", granularity
-        )
+        region_data = get_cost_data(start_date, end_date, service, "REGION", granularity)
 
         # Display costs for each month
         for period in region_data["ResultsByTime"]:
             # Create and display monthly table
-            table = create_cost_table(
-                period, console.width, "REGION", top, show_all, granularity
-            )
+            table = create_cost_table(period, console.width, "REGION", top, show_all, granularity)
             console.print(table)
 
     # Display cost breakdown insights
@@ -561,22 +563,38 @@ def analyze_costs_detailed(
     console.print(summary_table)
 
 
-def get_cost_reduction_tip(service_name: str) -> str | None:
+def get_cost_reduction_tip(service_name: str) -> Optional[str]:
     """Get cost reduction tip for specific services."""
     tips = {
-        AWSService.CLOUDWATCH.aws_name: "Consider optimizing log retention, reducing alarms, or consolidating dashboards",
-        AWSService.S3.aws_name: "Review storage classes, lifecycle policies, and delete unnecessary objects",
-        AWSService.RDS.aws_name: "Consider reserved instances, stop unused instances, or optimize instance size",
-        AWSService.EC2.aws_name: "Use Spot/Reserved instances, right-size instances, or terminate unused resources",
-        AWSService.LAMBDA.aws_name: "Optimize memory allocation, reduce duration, or consolidate functions",
-        AWSService.DYNAMODB.aws_name: "Review provisioned capacity, use on-demand when appropriate",
-        AWSService.ECR.aws_name: "Clean up unused container images and review lifecycle policies",
+        AWSService.CLOUDWATCH.aws_name: (
+            "Consider optimizing log retention, reducing alarms, or consolidating dashboards"
+        ),
+        AWSService.S3.aws_name: (
+            "Review storage classes, lifecycle policies, and delete unnecessary objects"
+        ),
+        AWSService.RDS.aws_name: (
+            "Consider reserved instances, stop unused instances, or optimize instance size"
+        ),
+        AWSService.EC2.aws_name: (
+            "Use Spot/Reserved instances, right-size instances, or terminate unused resources"
+        ),
+        AWSService.LAMBDA.aws_name: (
+            "Optimize memory allocation, reduce duration, or consolidate functions"
+        ),
+        AWSService.DYNAMODB.aws_name: (
+            "Review provisioned capacity, use on-demand when appropriate"
+        ),
+        AWSService.ECR.aws_name: ("Clean up unused container images and review lifecycle policies"),
         AWSService.ROUTE53.aws_name: "Review hosted zones and resource record sets",
-        AWSService.SNS.aws_name: "Review notification volume and optimize topic/subscription patterns",
+        AWSService.SNS.aws_name: (
+            "Review notification volume and optimize topic/subscription patterns"
+        ),
         AWSService.SQS.aws_name: "Review queue usage and message volume",
         AWSService.ELB.aws_name: "Consolidate load balancers and remove unused ones",
-        AWSService.EFS.aws_name: "Review file system usage and move infrequently accessed data to lower-cost tiers",
-        AWSService.API_GATEWAY.aws_name: "Implement caching and review API call volume",
+        AWSService.EFS.aws_name: (
+            "Review file system usage and move infrequently accessed data to lower-cost tiers"
+        ),
+        AWSService.API_GATEWAY.aws_name: ("Implement caching and review API call volume"),
     }
 
     # Check for exact matches
@@ -594,7 +612,7 @@ def get_cost_reduction_tip(service_name: str) -> str | None:
 def analyze_costs_simple(
     start_date: str,
     end_date: str,
-    service: str | None,
+    service: Optional[str],
     top: int,
     show_all: bool,
     granularity: str = "MONTHLY",
@@ -627,9 +645,7 @@ def analyze_costs_simple(
             break
 
     if not has_data:
-        console.print(
-            "[bold yellow]No cost data found for the specified parameters.[/bold yellow]"
-        )
+        console.print("[bold yellow]No cost data found for the specified parameters.[/bold yellow]")
         return
 
     # Display costs for each month
@@ -651,9 +667,7 @@ def analyze_costs_simple(
         monthly_totals.append((month_name, monthly_total))
 
         # Create and display monthly table
-        table = create_cost_table(
-            period, console.width, "SERVICE", top, show_all, granularity
-        )
+        table = create_cost_table(period, console.width, "SERVICE", top, show_all, granularity)
         console.print(table)
 
     # Display summary table
@@ -715,7 +729,8 @@ def analyze_costs_simple(
         for item_name, amount in top_items:
             percentage = (amount / grand_total) * 100
             console.print(
-                f"• [cyan]{item_name}[/cyan]: ${amount:.2f} ([bold]{percentage:.1f}%[/bold] of total costs)"
+                f"• [cyan]{item_name}[/cyan]: ${amount:.2f} "
+                f"([bold]{percentage:.1f}%[/bold] of total costs)"
             )
 
             # Provide tips for known services
