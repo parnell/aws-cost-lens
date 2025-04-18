@@ -6,9 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
 keywords = ["aws", "cost", "billing", "cloud"]
-authors = [
-    {name = "Your Name", email = "your.email@example.com"}
-]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -26,6 +23,11 @@ dependencies = [
     "boto3>=1.28.0",
     "rich>=13.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/parnell/aws-cost-lens"
+Repository = "https://github.com/parnell/aws-cost-lens"
+Issues = "https://github.com/parnell/aws-cost-lens/issues"
 
 [project.scripts]
 aws-cost-lens = "aws_cost_lens.cli:entry_point"
