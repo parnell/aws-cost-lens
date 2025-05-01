@@ -97,6 +97,7 @@ def get_cost_data(
     service: Optional[str],
     group_by: Union[str, list[str]],
     granularity: str = "MONTHLY",
+    region: Optional[str] = None,
 ) -> dict:
     """Fetch cost data from AWS Cost Explorer API."""
     console = Console()
@@ -159,12 +160,29 @@ def get_cost_data(
                 request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": key} for key in group_by]
 
             # Add service filter if specified
-            if service:
-                # Normalize the service name
-                normalized_service = AWSService.get_service(service)
-                request_params["Filter"] = {
-                    "Dimensions": {"Key": "SERVICE", "Values": [normalized_service]}
-                }
+            if service or region:
+                filter_dict = {"Dimensions": {}}
+
+                if service:
+                    # Normalize the service name
+                    normalized_service = AWSService.get_service(service)
+                    filter_dict["Dimensions"]["Key"] = "SERVICE"
+                    filter_dict["Dimensions"]["Values"] = [normalized_service]
+
+                if region:
+                    # If both service and region are specified, use 'And' operator
+                    if service:
+                        filter_dict = {
+                            "And": [
+                                {"Dimensions": {"Key": "SERVICE", "Values": [normalized_service]}},
+                                {"Dimensions": {"Key": "REGION", "Values": [region]}},
+                            ]
+                        }
+                    else:
+                        filter_dict["Dimensions"]["Key"] = "REGION"
+                        filter_dict["Dimensions"]["Values"] = [region]
+
+                request_params["Filter"] = filter_dict
 
             response = ce_client.get_cost_and_usage(**request_params)
 
@@ -177,7 +195,7 @@ def get_cost_data(
             sys.exit(1)
 
 
-def list_available_services(start_date: str, end_date: str) -> None:
+def list_available_services(start_date: str, end_date: str, region: Optional[str] = None) -> None:
     """List all available AWS services that have cost data."""
     console = Console()
 
@@ -196,6 +214,10 @@ def list_available_services(start_date: str, end_date: str) -> None:
                     {"Type": "DIMENSION", "Key": "SERVICE"},
                 ],
             }
+
+            # Add region filter if specified
+            if region:
+                request_params["Filter"] = {"Dimensions": {"Key": "REGION", "Values": [region]}}
 
             response = ce_client.get_cost_and_usage(**request_params)
 
@@ -279,6 +301,19 @@ def create_cost_table(
 
     title = f"{title_prefix} {period_display} Costs"
 
+    # Calculate monthly total to check if this is an in-progress month
+    monthly_total = 0.0
+    for group in period_data.get("Groups", []):
+        amount = float(group["Metrics"]["BlendedCost"]["Amount"])
+        monthly_total += amount
+
+    # Check if this is an in-progress month
+    is_in_progress = should_show_in_progress(period_start, monthly_total)
+
+    # Modify title for in-progress months
+    if is_in_progress:
+        title = f"{title_prefix} {period_display} Costs [yellow](In Progress)[/yellow]"
+
     # Choose column title based on grouping
     group_titles = {
         "SERVICE": "Service",
@@ -301,13 +336,23 @@ def create_cost_table(
 
     # Create title with count information
     if show_all or zero_count == 0:
-        title = f"{title_prefix} {period_display} Costs"
+        if not is_in_progress:
+            title = f"{title_prefix} {period_display} Costs"
+        else:
+            title = f"{title_prefix} {period_display} Costs [yellow](In Progress)[/yellow]"
     else:
-        title = (
-            f"{title_prefix} {period_display} Costs "
-            f"[dim]• Showing {non_zero_count} of {total_count} items "
-            f"(hidden: {zero_count} zero-cost items)[/dim]"
-        )
+        if not is_in_progress:
+            title = (
+                f"{title_prefix} {period_display} Costs "
+                f"[dim]• Showing {non_zero_count} of {total_count} items "
+                f"(hidden: {zero_count} zero-cost items)[/dim]"
+            )
+        else:
+            title = (
+                f"{title_prefix} {period_display} Costs [yellow](In Progress)[/yellow] "
+                f"[dim]• Showing {non_zero_count} of {total_count} items "
+                f"(hidden: {zero_count} zero-cost items)[/dim]"
+            )
 
     table = Table(title=title, expand=True)
     table.add_column(group_title, style="cyan")
@@ -316,7 +361,10 @@ def create_cost_table(
 
     # Check if there's any data
     if not period_data.get("Groups"):
-        table.add_row("No data found", "$0.00", "")
+        if is_in_progress:
+            table.add_row("In Progress", "[yellow]Data not yet available[/yellow]", "")
+        else:
+            table.add_row("No data found", "$0.00", "")
         return table
 
     # Sort by cost (highest first)
@@ -368,7 +416,62 @@ def create_cost_table(
     else:
         table.caption = "Distribution bars show relative cost compared to the highest item"
 
+    # Add in-progress note to the caption if applicable
+    if is_in_progress:
+        if table.caption:
+            table.caption += (
+                "\n[yellow]Note: This month is still in progress. Data may be incomplete.[/yellow]"
+            )
+        else:
+            table.caption = (
+                "[yellow]Note: This month is still in progress. Data may be incomplete.[/yellow]"
+            )
+
     return table
+
+
+def should_show_in_progress(period_date: str, monthly_total: float) -> bool:
+    """
+    Determine if a month should be shown as 'In Progress'.
+
+    Args:
+        period_date: The start date of the period in 'YYYY-MM-DD' format.
+        monthly_total: The total cost for the month.
+
+    Returns:
+        bool: True if the month should show as 'In Progress', False otherwise.
+    """
+    # Check if the total is effectively zero
+    if monthly_total > 0.01:
+        return False
+
+    # Get the period date as a datetime object
+    period_dt = datetime.strptime(period_date, "%Y-%m-%d")
+    period_month = period_dt.month
+    period_year = period_dt.year
+
+    # Get the current date
+    today = datetime.now()
+    current_month = today.month
+    current_year = today.year
+
+    # Current month should show as 'In Progress'
+    if period_year == current_year and period_month == current_month:
+        return True
+
+    # Special case: if this is the immediately previous month and we're in the early
+    # days of the current month (before the 5th), treat the previous month as 'In Progress' too
+    if (period_year == current_year and period_month == current_month - 1) or (
+        current_month == 1 and period_month == 12 and period_year == current_year - 1
+    ):
+        if today.day <= 5:  # Early days of the month
+            return True
+
+    # If it's future data or very recent, also mark as in progress
+    if period_year > current_year or (period_year == current_year and period_month > current_month):
+        return True
+
+    return False
 
 
 def analyze_costs_detailed(
@@ -376,9 +479,10 @@ def analyze_costs_detailed(
     end_date: str,
     service: Optional[str],
     top: int,
-    show_region: bool,
-    show_all: bool,
+    show_region: bool = False,
+    show_all: bool = False,
     granularity: str = "MONTHLY",
+    region: Optional[str] = None,
 ) -> None:
     """Analyze costs with detailed breakdown by SERVICE, USAGE_TYPE, and optionally REGION."""
     console = Console()
@@ -394,13 +498,18 @@ def analyze_costs_detailed(
     if display_service:
         title += f" - {display_service}"
 
+    if region:
+        title += f" in {region}"
+
     console.print(Panel(f"[bold]{title}[/bold]\n{start_date} to {end_date}"))
 
     # Process each grouping type
     console.print("\n[bold]Analyzing by USAGE_TYPE with SERVICE information[/bold]")
 
     # Get cost data with both SERVICE and USAGE_TYPE groupings
-    cost_data = get_cost_data(start_date, end_date, service, ["SERVICE", "USAGE_TYPE"], granularity)
+    cost_data = get_cost_data(
+        start_date, end_date, service, ["SERVICE", "USAGE_TYPE"], granularity, region
+    )
 
     # Check if we got any data
     has_data = False
@@ -496,7 +605,7 @@ def analyze_costs_detailed(
     # If region breakdown is requested, add that too
     if show_region:
         console.print("\n[bold]Analyzing by REGION[/bold]")
-        region_data = get_cost_data(start_date, end_date, service, "REGION", granularity)
+        region_data = get_cost_data(start_date, end_date, service, "REGION", granularity, region)
 
         # Display costs for each month
         for period in region_data["ResultsByTime"]:
@@ -508,7 +617,7 @@ def analyze_costs_detailed(
     console.print("\n[bold]Cost Summary by Month[/bold]")
 
     # Get service-level data for summary
-    service_data = get_cost_data(start_date, end_date, service, "SERVICE", granularity)
+    service_data = get_cost_data(start_date, end_date, service, "SERVICE", granularity, region)
     monthly_totals = []
     grand_total = 0.0
 
@@ -521,9 +630,20 @@ def analyze_costs_detailed(
         if "Total" in period and "BlendedCost" in period["Total"]:
             monthly_total = float(period["Total"]["BlendedCost"]["Amount"])
 
-        grand_total += monthly_total
-        month_name = format_date_period(period["TimePeriod"]["Start"], granularity)
-        monthly_totals.append((month_name, monthly_total))
+        # Get period information
+        period_start = period["TimePeriod"]["Start"]
+        month_name = format_date_period(period_start, granularity)
+
+        # Check if this month should be shown as "In Progress"
+        is_in_progress = should_show_in_progress(period_start, monthly_total)
+
+        if is_in_progress:
+            # Current or very recent month with minimal data - mark as in progress
+            monthly_totals.append((month_name, 0, True))
+        else:
+            # Regular month with data
+            grand_total += monthly_total
+            monthly_totals.append((month_name, monthly_total, False))
 
     # Display summary table
     summary_table = Table(title="Monthly Summary", expand=True)
@@ -531,10 +651,16 @@ def analyze_costs_detailed(
     summary_table.add_column("Total Cost", justify="right", style="green")
     summary_table.add_column("Distribution (% of max)", ratio=1)
 
-    # Find max monthly total for bar scaling
-    max_monthly_total = max([total for _, total in monthly_totals], default=0)
+    # Find max monthly total for bar scaling (exclude in-progress months)
+    complete_monthly_costs = [total for _, total, in_progress in monthly_totals if not in_progress]
+    max_monthly_total = max(complete_monthly_costs, default=0) if complete_monthly_costs else 0
 
-    for month, total in monthly_totals:
+    for month, total, in_progress in monthly_totals:
+        if in_progress:
+            # Show "In Progress" for months marked as in-progress
+            summary_table.add_row(month, "[yellow]In Progress[/yellow]", "")
+            continue
+
         # Calculate bar length
         max_bar_width = console.width / 2
         bar_width = 0
@@ -613,9 +739,10 @@ def analyze_costs_simple(
     start_date: str,
     end_date: str,
     service: Optional[str],
-    top: int,
-    show_all: bool,
+    top: int = 0,
+    show_all: bool = False,
     granularity: str = "MONTHLY",
+    region: Optional[str] = None,
 ) -> None:
     """Simple cost analysis view."""
     console = Console()
@@ -632,10 +759,13 @@ def analyze_costs_simple(
     else:
         title = f"AWS {display_service} Cost Analysis"
 
+    if region:
+        title += f" in {region}"
+
     console.print(Panel(f"[bold]{title}[/bold]\n{start_date} to {end_date}"))
 
     # Get cost data from AWS Cost Explorer using SERVICE grouping for simple view
-    cost_data = get_cost_data(start_date, end_date, service, "SERVICE", granularity)
+    cost_data = get_cost_data(start_date, end_date, service, "SERVICE", granularity, region)
 
     # Check if we got any data
     has_data = False
@@ -662,13 +792,24 @@ def analyze_costs_simple(
         if "Total" in period and "BlendedCost" in period["Total"]:
             monthly_total = float(period["Total"]["BlendedCost"]["Amount"])
 
-        grand_total += monthly_total
-        month_name = format_date_period(period["TimePeriod"]["Start"], granularity)
-        monthly_totals.append((month_name, monthly_total))
-
         # Create and display monthly table
         table = create_cost_table(period, console.width, "SERVICE", top, show_all, granularity)
         console.print(table)
+
+        # Get period information
+        period_start = period["TimePeriod"]["Start"]
+        month_name = format_date_period(period_start, granularity)
+
+        # Check if this month should be shown as "In Progress"
+        is_in_progress = should_show_in_progress(period_start, monthly_total)
+
+        if is_in_progress:
+            # Current or very recent month with minimal data - mark as in progress
+            monthly_totals.append((month_name, 0, True))
+        else:
+            # Regular month with data
+            grand_total += monthly_total
+            monthly_totals.append((month_name, monthly_total, False))
 
     # Display summary table
     summary_table = Table(title="Monthly Summary", expand=True)
@@ -676,10 +817,16 @@ def analyze_costs_simple(
     summary_table.add_column("Total Cost", justify="right", style="green")
     summary_table.add_column("Distribution (% of max)", ratio=1)
 
-    # Find max monthly total for bar scaling
-    max_monthly_total = max([total for _, total in monthly_totals], default=0)
+    # Find max monthly total for bar scaling (exclude in-progress months)
+    complete_monthly_costs = [total for _, total, in_progress in monthly_totals if not in_progress]
+    max_monthly_total = max(complete_monthly_costs, default=0) if complete_monthly_costs else 0
 
-    for month, total in monthly_totals:
+    for month, total, in_progress in monthly_totals:
+        if in_progress:
+            # Show "In Progress" for months marked as in-progress
+            summary_table.add_row(month, "[yellow]In Progress[/yellow]", "")
+            continue
+
         # Calculate bar length
         max_bar_width = console.width / 2
         bar_width = 0

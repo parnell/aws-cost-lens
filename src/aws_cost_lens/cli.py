@@ -57,7 +57,14 @@ def parse_args():
         help="(Default behavior) Show simplified service-level breakdown",
     )
     parser.add_argument(
-        "--region", action="store_true", help="Include region breakdown in detailed analysis"
+        "--region", 
+        help="Filter results to a specific AWS region (e.g., us-east-1)"
+    )
+    parser.add_argument(
+        "--show-region", 
+        action="store_true", 
+        help="Include region breakdown in detailed analysis",
+        dest="show_region"
     )
     parser.add_argument(
         "--list-services", action="store_true", help="List all available AWS services and exit"
@@ -103,7 +110,7 @@ def main():
 
         # If user requested to list services, do that and exit
         if args.list_services:
-            list_available_services(start_date, end_date)
+            list_available_services(start_date, end_date, args.region)
             return 0
 
         # Use the service parameter directly - if None, it will show all services
@@ -116,9 +123,10 @@ def main():
                 end_date=end_date,
                 service=service,
                 top=args.top,
-                region=args.region,
+                show_region=args.show_region,
                 show_all=args.show_all,
                 granularity=args.granularity,
+                region=args.region,
             )
         else:
             analyze_costs_simple(
@@ -128,6 +136,7 @@ def main():
                 top=args.top,
                 show_all=args.show_all,
                 granularity=args.granularity,
+                region=args.region,
             )
 
         return 0
