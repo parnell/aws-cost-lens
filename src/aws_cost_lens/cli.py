@@ -9,11 +9,9 @@ import argparse
 import sys
 from datetime import datetime, timedelta
 
-from aws_cost_lens.core import (
-    analyze_costs_detailed,
-    analyze_costs_simple,
-    list_available_services,
-)
+from aws_cost_lens.core import analyze_costs_detailed, analyze_costs_simple, list_available_services
+
+METRIC_CHOICES = ("auto", "unblended", "blended", "net-unblended")
 
 
 def parse_args():
@@ -81,6 +79,15 @@ def parse_args():
         help="Time granularity for the cost analysis (HOURLY only works for the last 14 days)",
     )
     parser.add_argument("--version", action="store_true", help="Show version information and exit")
+    parser.add_argument(
+        "--metric",
+        choices=METRIC_CHOICES,
+        default="auto",
+        help=(
+            "Cost Explorer metric: auto (default) picks the strongest of Unblended / Blended / "
+            "NetUnblended for the date range; or force unblended, blended, or net-unblended"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -110,7 +117,7 @@ def main():
 
         # If user requested to list services, do that and exit
         if args.list_services:
-            list_available_services(start_date, end_date, args.region)
+            list_available_services(start_date, end_date, args.region, args.metric)
             return 0
 
         # Use the service parameter directly - if None, it will show all services
@@ -127,6 +134,7 @@ def main():
                 show_all=args.show_all,
                 granularity=args.granularity,
                 region=args.region,
+                metric_preference=args.metric,
             )
         else:
             analyze_costs_simple(
@@ -137,6 +145,7 @@ def main():
                 show_all=args.show_all,
                 granularity=args.granularity,
                 region=args.region,
+                metric_preference=args.metric,
             )
 
         return 0

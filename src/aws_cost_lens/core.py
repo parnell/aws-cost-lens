@@ -18,6 +18,141 @@ from rich.table import Table
 # AWS Cost Explorer limits
 MAX_HOURLY_GRANULARITY_DAYS = 14
 
+# When the user does not force a metric (`auto`), we pick whichever of these has the largest
+# total for the response. Some accounts return all zeros for UnblendedCost only; others for
+# BlendedCost. Requesting all three in one API call avoids wrong or empty results.
+CE_METRICS_BUNDLE = ["UnblendedCost", "BlendedCost", "NetUnblendedCost"]
+
+# Fallback display metric if every bundled metric sums to zero.
+DEFAULT_COST_METRIC = "UnblendedCost"
+
+# CLI-friendly names -> Cost Explorer API metric names (see GetCostAndUsage Metrics).
+# Does not include "auto" (handled separately).
+COST_METRIC_ALIASES: dict[str, str] = {
+    "unblended": "UnblendedCost",
+    "blended": "BlendedCost",
+    "net-unblended": "NetUnblendedCost",
+}
+
+
+def get_account_header_markup() -> str:
+    """
+    Rich markup line identifying the caller's AWS account: name (when known) and 12-digit ID.
+
+    Tries Organizations account name (matches console account name in many orgs), then IAM
+    account alias, then the account ID alone.
+    """
+    try:
+        account_id = boto3.client("sts").get_caller_identity().get("Account") or ""
+    except Exception:
+        return "[yellow]Account: unable to resolve (check AWS credentials)[/yellow]"
+
+    if not account_id:
+        return "[yellow]Account: unknown[/yellow]"
+
+    name: Optional[str] = None
+    try:
+        org = boto3.client("organizations")
+        acc = org.describe_account(AccountId=account_id).get("Account") or {}
+        raw = (acc.get("Name") or "").strip()
+        if raw:
+            name = raw
+    except Exception:
+        pass
+
+    if not name:
+        try:
+            aliases = boto3.client("iam").list_account_aliases().get("AccountAliases") or []
+            if aliases:
+                name = aliases[0]
+        except Exception:
+            pass
+
+    if name:
+        return f"Account: [cyan]{name}[/cyan] [dim]({account_id})[/dim]"
+    return f"Account: [cyan]{account_id}[/cyan]"
+
+
+def _merge_cost_and_usage_pages(pages: list[dict]) -> dict:
+    """Merge paginated get_cost_and_usage responses (extra Groups per time period)."""
+    if not pages:
+        return {}
+    merged = pages[0]
+    for page in pages[1:]:
+        for i, period in enumerate(page.get("ResultsByTime", [])):
+            merged["ResultsByTime"][i]["Groups"].extend(period.get("Groups", []))
+    return merged
+
+
+def _fetch_cost_and_usage_paginated(ce_client, request_params: dict) -> dict:
+    """Call get_cost_and_usage until NextPageToken is exhausted."""
+    pages: list[dict] = []
+    next_token: Optional[str] = None
+    while True:
+        params = dict(request_params)
+        if next_token:
+            params["NextPageToken"] = next_token
+        page = ce_client.get_cost_and_usage(**params)
+        pages.append(page)
+        next_token = page.get("NextPageToken")
+        if not next_token:
+            break
+    return _merge_cost_and_usage_pages(pages)
+
+
+def _period_metric_total(period: dict, metric: str) -> float:
+    """Total for one metric in a time period (prefer API Total, else sum of groups)."""
+    t = period.get("Total") or {}
+    block = t.get(metric)
+    if block and block.get("Amount") not in (None, ""):
+        return float(block["Amount"])
+    return sum(_metric_amount_raw(g, metric) for g in period.get("Groups", []))
+
+
+def _format_net_usd(value: float) -> str:
+    """Format a net dollar amount; near-zero floats print as $0.00."""
+    if abs(value) < 0.005:
+        return "$0.00"
+    return f"${value:.2f}"
+
+
+def _monthly_summary_bar(total: float, max_abs: float, console_width: int) -> str:
+    """Rich bar for a monthly net total; scales by magnitude so negatives do not break layout."""
+    if max_abs < 1e-9:
+        return ""
+    max_bar_width = console_width / 2
+    bar_width = max(0, round((abs(total) / max_abs) * max_bar_width))
+    bar = "█" * bar_width
+    pct = (abs(total) / max_abs) * 100
+    if pct < 100 - 1e-9:
+        return f"{bar} {pct:.1f}%"
+    return f"{bar} (max)"
+
+
+def _metric_amount_raw(group: dict, metric: str) -> float:
+    """Parse one metric from a group; missing keys or amounts are 0."""
+    block = (group.get("Metrics") or {}).get(metric)
+    if not block or block.get("Amount") in (None, ""):
+        return 0.0
+    return float(block["Amount"])
+
+
+def resolve_effective_metric(results_by_time: list, metric_preference: str) -> str:
+    """
+    Choose which Cost Explorer metric to display.
+
+    ``metric_preference`` is ``auto`` or a key in COST_METRIC_ALIASES (e.g. ``unblended``).
+    """
+    if metric_preference != "auto":
+        return COST_METRIC_ALIASES[metric_preference]
+    totals = {m: 0.0 for m in CE_METRICS_BUNDLE}
+    for period in results_by_time:
+        for m in CE_METRICS_BUNDLE:
+            totals[m] += abs(_period_metric_total(period, m))
+    # Prefer Unblended, then NetUnblended, then Blended when totals tie at 0 (or equal).
+    order = ["UnblendedCost", "NetUnblendedCost", "BlendedCost"]
+    return max(order, key=lambda k: (totals[k], -order.index(k)))
+
 
 class ServiceInfo(NamedTuple):
     """Container for AWS service information."""
@@ -150,7 +285,7 @@ def get_cost_data(
             request_params = {
                 "TimePeriod": {"Start": start_date, "End": end_date},
                 "Granularity": granularity,
-                "Metrics": ["BlendedCost"],
+                "Metrics": list(CE_METRICS_BUNDLE),
             }
 
             # Handle single string or list of group_by values
@@ -184,7 +319,7 @@ def get_cost_data(
 
                 request_params["Filter"] = filter_dict
 
-            response = ce_client.get_cost_and_usage(**request_params)
+            response = _fetch_cost_and_usage_paginated(ce_client, request_params)
 
             progress.update(task, advance=1)
             return response
@@ -195,9 +330,16 @@ def get_cost_data(
             sys.exit(1)
 
 
-def list_available_services(start_date: str, end_date: str, region: Optional[str] = None) -> None:
+def list_available_services(
+    start_date: str,
+    end_date: str,
+    region: Optional[str] = None,
+    metric_preference: str = "auto",
+) -> None:
     """List all available AWS services that have cost data."""
     console = Console()
+    console.print(Panel(get_account_header_markup(), title="AWS account"))
+    console.print()
 
     with Progress() as progress:
         task = progress.add_task("[cyan]Fetching available AWS services...", total=1)
@@ -209,7 +351,7 @@ def list_available_services(start_date: str, end_date: str, region: Optional[str
             request_params = {
                 "TimePeriod": {"Start": start_date, "End": end_date},
                 "Granularity": "MONTHLY",
-                "Metrics": ["BlendedCost"],
+                "Metrics": list(CE_METRICS_BUNDLE),
                 "GroupBy": [
                     {"Type": "DIMENSION", "Key": "SERVICE"},
                 ],
@@ -219,14 +361,18 @@ def list_available_services(start_date: str, end_date: str, region: Optional[str
             if region:
                 request_params["Filter"] = {"Dimensions": {"Key": "REGION", "Values": [region]}}
 
-            response = ce_client.get_cost_and_usage(**request_params)
+            response = _fetch_cost_and_usage_paginated(ce_client, request_params)
 
             progress.update(task, advance=1)
 
-            # Extract unique service names
+            chosen = resolve_effective_metric(response.get("ResultsByTime", []), metric_preference)
+
+            # Extract unique service names (non-negligible cost under chosen metric)
             services = set()
             for period in response.get("ResultsByTime", []):
                 for group in period.get("Groups", []):
+                    if abs(_metric_amount_raw(group, chosen)) < 0.000001:
+                        continue
                     service_name = group["Keys"][0]
                     services.add(service_name)
 
@@ -280,6 +426,11 @@ def format_date_period(date_str: str, granularity: str = "MONTHLY") -> str:
         return date_str
 
 
+def _metric_amount(group: dict, metric: str) -> float:
+    """Parse cost amount for the requested Cost Explorer metric."""
+    return _metric_amount_raw(group, metric)
+
+
 def create_cost_table(
     period_data: dict,
     console_width: int,
@@ -287,6 +438,7 @@ def create_cost_table(
     limit: int,
     show_all: bool = False,
     granularity: str = "MONTHLY",
+    metric: str = DEFAULT_COST_METRIC,
 ) -> Table:
     """Create a rich table for a single time period."""
     period_start = period_data["TimePeriod"]["Start"]
@@ -304,7 +456,7 @@ def create_cost_table(
     # Calculate monthly total to check if this is an in-progress month
     monthly_total = 0.0
     for group in period_data.get("Groups", []):
-        amount = float(group["Metrics"]["BlendedCost"]["Amount"])
+        amount = _metric_amount(group, metric)
         monthly_total += amount
 
     # Check if this is an in-progress month
@@ -326,12 +478,12 @@ def create_cost_table(
     costs = []
     for group in period_data["Groups"]:
         name = group["Keys"][0]
-        amount = float(group["Metrics"]["BlendedCost"]["Amount"])
+        amount = _metric_amount(group, metric)
         costs.append((name, amount))
 
     # Calculate displayed vs total count
     total_count = len(costs)
-    non_zero_count = sum(1 for _, amount in costs if amount >= 0.01)
+    non_zero_count = sum(1 for _, amount in costs if abs(amount) >= 0.01)
     zero_count = total_count - non_zero_count
 
     # Create title with count information
@@ -374,22 +526,20 @@ def create_cost_table(
     if limit > 0:
         costs = costs[:limit]
 
-    # Find max cost for bar scaling
-    max_cost = max([cost for _, cost in costs], default=0)
+    # Find max cost for bar scaling (use magnitude so credits/negatives still render)
+    max_cost = max([abs(c) for _, c in costs], default=0)
 
     # Add rows
     for name, amount in costs:
-        # Skip zero-cost items unless show_all is True
-        if amount < 0.01 and not show_all:
+        # Skip negligible amounts unless show_all is True (include credits / negatives)
+        if abs(amount) < 0.01 and not show_all:
             continue
 
         # Calculate bar length (max is console width / 2)
         max_bar_width = console_width / 2
         bar_width = 0
         if max_cost > 0:
-            # Ensure the top item gets the full bar width
-            percentage = (amount / max_cost) * 100
-            bar_width = round((amount / max_cost) * max_bar_width)
+            bar_width = round((abs(amount) / max_cost) * max_bar_width)
 
         # Create a progress bar with percentage
         bar = "█" * bar_width
@@ -397,7 +547,7 @@ def create_cost_table(
         # For items that are a fraction of max cost, add percentage label
         if max_cost > 0:
             MAX_PERCENTAGE = 100
-            percentage = (amount / max_cost) * 100
+            percentage = (abs(amount) / max_cost) * 100
             # Only add percentage if not 100%
             if percentage < MAX_PERCENTAGE:
                 bar = f"{bar} {percentage:.1f}%"
@@ -483,6 +633,7 @@ def analyze_costs_detailed(
     show_all: bool = False,
     granularity: str = "MONTHLY",
     region: Optional[str] = None,
+    metric_preference: str = "auto",
 ) -> None:
     """Analyze costs with detailed breakdown by SERVICE, USAGE_TYPE, and optionally REGION."""
     console = Console()
@@ -501,14 +652,23 @@ def analyze_costs_detailed(
     if region:
         title += f" in {region}"
 
-    console.print(Panel(f"[bold]{title}[/bold]\n{start_date} to {end_date}"))
+    console.print(
+        Panel(
+            f"{get_account_header_markup()}\n[bold]{title}[/bold]\n{start_date} to {end_date}"
+        )
+    )
 
     # Process each grouping type
     console.print("\n[bold]Analyzing by USAGE_TYPE with SERVICE information[/bold]")
 
     # Get cost data with both SERVICE and USAGE_TYPE groupings
     cost_data = get_cost_data(
-        start_date, end_date, service, ["SERVICE", "USAGE_TYPE"], granularity, region
+        start_date,
+        end_date,
+        service,
+        ["SERVICE", "USAGE_TYPE"],
+        granularity,
+        region,
     )
 
     # Check if we got any data
@@ -521,6 +681,13 @@ def analyze_costs_detailed(
     if not has_data:
         console.print("[yellow]No data found for the specified parameters.[/yellow]")
         return
+
+    display_metric = resolve_effective_metric(cost_data["ResultsByTime"], metric_preference)
+    if metric_preference == "auto":
+        console.print(
+            f"[dim]Using Cost Explorer metric: {display_metric} "
+            f"(picked from Unblended / Blended / NetUnblended totals)[/dim]"
+        )
 
     # Display costs for each month
     for period in cost_data["ResultsByTime"]:
@@ -535,12 +702,12 @@ def analyze_costs_detailed(
             service_name = keys[0]
             usage_type = keys[1]
 
-            amount = float(group["Metrics"]["BlendedCost"]["Amount"])
+            amount = _metric_amount(group, display_metric)
             costs.append((service_name, usage_type, amount))
 
         # Calculate displayed vs total count
         total_count = len(costs)
-        non_zero_count = sum(1 for _, _, amount in costs if amount >= 0.01)
+        non_zero_count = sum(1 for _, _, amount in costs if abs(amount) >= 0.01)
         zero_count = total_count - non_zero_count
 
         # Create title with count information
@@ -566,29 +733,27 @@ def analyze_costs_detailed(
         if top > 0:
             costs = costs[:top]
 
-        # Find max cost for bar scaling
-        max_cost = max([cost for _, _, cost in costs], default=0)
+        # Find max cost for bar scaling (magnitude)
+        max_cost = max([abs(c) for _, _, c in costs], default=0)
 
         # Add rows
         for service_name, usage_type, amount in costs:
-            # Skip zero-cost items unless show_all is True
-            if amount < 0.01 and not show_all:
+            # Skip negligible amounts unless show_all is True (include credits / negatives)
+            if abs(amount) < 0.01 and not show_all:
                 continue
 
             # Calculate bar length (max is console width / 2)
             max_bar_width = console.width / 2
             bar_width = 0
             if max_cost > 0:
-                # Ensure the top item gets the full bar width
-                percentage = (amount / max_cost) * 100
-                bar_width = round((amount / max_cost) * max_bar_width)
+                bar_width = round((abs(amount) / max_cost) * max_bar_width)
 
             # Create a progress bar with percentage
             bar = "█" * bar_width
 
             # For items that are a fraction of max cost, add percentage label
             if max_cost > 0:
-                percentage = (amount / max_cost) * 100
+                percentage = (abs(amount) / max_cost) * 100
                 # Only add percentage if not 100%
                 if percentage < 100:
                     bar = f"{bar} {percentage:.1f}%"
@@ -610,7 +775,9 @@ def analyze_costs_detailed(
         # Display costs for each month
         for period in region_data["ResultsByTime"]:
             # Create and display monthly table
-            table = create_cost_table(period, console.width, "REGION", top, show_all, granularity)
+            table = create_cost_table(
+                period, console.width, "REGION", top, show_all, granularity, display_metric
+            )
             console.print(table)
 
     # Display cost breakdown insights
@@ -622,13 +789,7 @@ def analyze_costs_detailed(
     grand_total = 0.0
 
     for period in service_data["ResultsByTime"]:
-        monthly_total = 0.0
-        for group in period.get("Groups", []):
-            monthly_total += float(group["Metrics"]["BlendedCost"]["Amount"])
-
-        # Add other costs not grouped (if any)
-        if "Total" in period and "BlendedCost" in period["Total"]:
-            monthly_total = float(period["Total"]["BlendedCost"]["Amount"])
+        monthly_total = _period_metric_total(period, display_metric)
 
         # Get period information
         period_start = period["TimePeriod"]["Start"]
@@ -651,9 +812,9 @@ def analyze_costs_detailed(
     summary_table.add_column("Total Cost", justify="right", style="green")
     summary_table.add_column("Distribution (% of max)", ratio=1)
 
-    # Find max monthly total for bar scaling (exclude in-progress months)
+    # Scale bars by largest |net| so months near $0 after credits still render sensibly
     complete_monthly_costs = [total for _, total, in_progress in monthly_totals if not in_progress]
-    max_monthly_total = max(complete_monthly_costs, default=0) if complete_monthly_costs else 0
+    max_monthly_abs = max((abs(t) for t in complete_monthly_costs), default=0.0)
 
     for month, total, in_progress in monthly_totals:
         if in_progress:
@@ -661,30 +822,17 @@ def analyze_costs_detailed(
             summary_table.add_row(month, "[yellow]In Progress[/yellow]", "")
             continue
 
-        # Calculate bar length
-        max_bar_width = console.width / 2
-        bar_width = 0
-        if max_monthly_total > 0:
-            # Ensure the top month gets the full bar width
-            percentage = (total / max_monthly_total) * 100
-            bar_width = round((total / max_monthly_total) * max_bar_width)
-
-        # Create a progress bar with percentage
-        bar = "█" * bar_width
-
-        # For months that are a fraction of max cost, add percentage label
-        if max_monthly_total > 0:
-            percentage = (total / max_monthly_total) * 100
-            # Only add percentage if not 100%
-            if percentage < 100:
-                bar = f"{bar} {percentage:.1f}%"
-            else:
-                bar = f"{bar} (max)"
-
-        summary_table.add_row(month, f"${total:.2f}", bar)
+        bar = _monthly_summary_bar(total, max_monthly_abs, console.width)
+        summary_table.add_row(month, _format_net_usd(total), bar)
 
     # Add grand total row without bar
-    summary_table.add_row("GRAND TOTAL", f"${grand_total:.2f}", "", style="bold")
+    summary_table.add_row("GRAND TOTAL", _format_net_usd(grand_total), "", style="bold")
+
+    summary_table.caption = (
+        "[dim]Monthly totals are Cost Explorer net amounts (all services in the period). "
+        "Credits or discounts on one line (often AWS Data Transfer) can offset usage elsewhere, "
+        "so the net can be ≈ $0 while per-service rows still show non-zero charges.[/dim]"
+    )
 
     console.print(summary_table)
 
@@ -743,6 +891,7 @@ def analyze_costs_simple(
     show_all: bool = False,
     granularity: str = "MONTHLY",
     region: Optional[str] = None,
+    metric_preference: str = "auto",
 ) -> None:
     """Simple cost analysis view."""
     console = Console()
@@ -762,7 +911,11 @@ def analyze_costs_simple(
     if region:
         title += f" in {region}"
 
-    console.print(Panel(f"[bold]{title}[/bold]\n{start_date} to {end_date}"))
+    console.print(
+        Panel(
+            f"{get_account_header_markup()}\n[bold]{title}[/bold]\n{start_date} to {end_date}"
+        )
+    )
 
     # Get cost data from AWS Cost Explorer using SERVICE grouping for simple view
     cost_data = get_cost_data(start_date, end_date, service, "SERVICE", granularity, region)
@@ -778,22 +931,24 @@ def analyze_costs_simple(
         console.print("[bold yellow]No cost data found for the specified parameters.[/bold yellow]")
         return
 
+    display_metric = resolve_effective_metric(cost_data["ResultsByTime"], metric_preference)
+    if metric_preference == "auto":
+        console.print(
+            f"[dim]Using Cost Explorer metric: {display_metric} "
+            f"(picked from Unblended / Blended / NetUnblended totals)[/dim]"
+        )
+
     # Display costs for each month
     grand_total = 0.0
     monthly_totals = []
 
     for period in cost_data["ResultsByTime"]:
-        # Calculate monthly total
-        monthly_total = 0.0
-        for group in period.get("Groups", []):
-            monthly_total += float(group["Metrics"]["BlendedCost"]["Amount"])
-
-        # Add other costs not grouped (if any)
-        if "Total" in period and "BlendedCost" in period["Total"]:
-            monthly_total = float(period["Total"]["BlendedCost"]["Amount"])
+        monthly_total = _period_metric_total(period, display_metric)
 
         # Create and display monthly table
-        table = create_cost_table(period, console.width, "SERVICE", top, show_all, granularity)
+        table = create_cost_table(
+            period, console.width, "SERVICE", top, show_all, granularity, display_metric
+        )
         console.print(table)
 
         # Get period information
@@ -817,9 +972,9 @@ def analyze_costs_simple(
     summary_table.add_column("Total Cost", justify="right", style="green")
     summary_table.add_column("Distribution (% of max)", ratio=1)
 
-    # Find max monthly total for bar scaling (exclude in-progress months)
+    # Scale bars by largest |net| so months near $0 after credits still render sensibly
     complete_monthly_costs = [total for _, total, in_progress in monthly_totals if not in_progress]
-    max_monthly_total = max(complete_monthly_costs, default=0) if complete_monthly_costs else 0
+    max_monthly_abs = max((abs(t) for t in complete_monthly_costs), default=0.0)
 
     for month, total, in_progress in monthly_totals:
         if in_progress:
@@ -827,35 +982,22 @@ def analyze_costs_simple(
             summary_table.add_row(month, "[yellow]In Progress[/yellow]", "")
             continue
 
-        # Calculate bar length
-        max_bar_width = console.width / 2
-        bar_width = 0
-        if max_monthly_total > 0:
-            # Ensure the top month gets the full bar width
-            percentage = (total / max_monthly_total) * 100
-            bar_width = round((total / max_monthly_total) * max_bar_width)
-
-        # Create a progress bar with percentage
-        bar = "█" * bar_width
-
-        # For months that are a fraction of max cost, add percentage label
-        if max_monthly_total > 0:
-            percentage = (total / max_monthly_total) * 100
-            # Only add percentage if not 100%
-            if percentage < 100:
-                bar = f"{bar} {percentage:.1f}%"
-            else:
-                bar = f"{bar} (max)"
-
-        summary_table.add_row(month, f"${total:.2f}", bar)
+        bar = _monthly_summary_bar(total, max_monthly_abs, console.width)
+        summary_table.add_row(month, _format_net_usd(total), bar)
 
     # Add grand total row without bar
-    summary_table.add_row("GRAND TOTAL", f"${grand_total:.2f}", "", style="bold")
+    summary_table.add_row("GRAND TOTAL", _format_net_usd(grand_total), "", style="bold")
+
+    summary_table.caption = (
+        "[dim]Monthly totals are Cost Explorer net amounts (all services in the period). "
+        "Credits or discounts on one line (often AWS Data Transfer) can offset usage elsewhere, "
+        "so the net can be ≈ $0 while per-service rows still show non-zero charges.[/dim]"
+    )
 
     console.print(summary_table)
 
     # Display cost breakdown insights
-    if grand_total > 0:
+    if grand_total > 0.01:
         console.print("\n[bold]Cost Breakdown Insights:[/bold]")
 
         # Aggregate costs by group type
@@ -863,7 +1005,7 @@ def analyze_costs_simple(
         for period in cost_data["ResultsByTime"]:
             for group in period.get("Groups", []):
                 item_name = group["Keys"][0]
-                amount = float(group["Metrics"]["BlendedCost"]["Amount"])
+                amount = _metric_amount(group, display_metric)
 
                 if item_name not in item_costs:
                     item_costs[item_name] = 0
