@@ -319,10 +319,6 @@ def _monthly_rec_usage_credit_bar(
             n_red = W - 1
     t.append("█" * n_red, style="red")
     t.append("█" * n_green, style="green")
-    t.append(
-        f"  {100 * paid_shown / denom:.0f}% paid · {100 * credit_mag / denom:.0f}% credits",
-        style="dim",
-    )
     return t
 
 
@@ -778,6 +774,7 @@ def create_cost_table(
     granularity: str = "MONTHLY",
     metric: str = DEFAULT_COST_METRIC,
     record_type_for_period: dict[str, float] | None = None,
+    verbose: bool = False,
 ) -> Table:
     """Create a rich table for a single time period.
 
@@ -896,23 +893,26 @@ def create_cost_table(
     if show_all and zero_count > 0:
         table.caption = f"Showing all items including {zero_count} with $0.00 cost"
 
-    cap_bits = [
-        "Bar: [red]red[/red] = usage (paid) vs largest usage in table; "
-        "[green]green[/green] = |credits| vs largest |credit| line (separate scales side by side)."
-    ]
-    if group_by == "SERVICE" and record_type_for_period:
-        u = record_type_for_period.get("Usage")
-        cr = record_type_for_period.get("Credit", 0.0) + record_type_for_period.get("Refund", 0.0)
-        if u is not None and abs(u) >= 0.005:
-            cap_bits.append(
-                "RECORD_TYPE for this period: Usage "
-                f"[red]{_format_net_usd(u)}[/red] • Credits/refunds "
-                f"[green]{_format_net_usd(cr)}[/green] (SERVICE rows allocate credits unevenly)."
+    if verbose:
+        cap_bits = [
+            "Bar: [red]red[/red] = usage (paid) vs largest usage in table; "
+            "[green]green[/green] = |credits| vs largest |credit| line (separate scales side by side)."
+        ]
+        if group_by == "SERVICE" and record_type_for_period:
+            u = record_type_for_period.get("Usage")
+            cr = record_type_for_period.get("Credit", 0.0) + record_type_for_period.get(
+                "Refund", 0.0
             )
-    if table.caption:
-        table.caption += "\n" + " ".join(cap_bits)
-    else:
-        table.caption = " ".join(cap_bits)
+            if u is not None and abs(u) >= 0.005:
+                cap_bits.append(
+                    "RECORD_TYPE for this period: Usage "
+                    f"[red]{_format_net_usd(u)}[/red] • Credits/refunds "
+                    f"[green]{_format_net_usd(cr)}[/green] (SERVICE rows allocate credits unevenly)."
+                )
+        if table.caption:
+            table.caption += "\n" + " ".join(cap_bits)
+        else:
+            table.caption = " ".join(cap_bits)
 
     # Add in-progress note to the caption if applicable
     if is_in_progress:
@@ -924,6 +924,149 @@ def create_cost_table(
             table.caption = (
                 "[yellow]Note: This month is still in progress. Data may be incomplete.[/yellow]"
             )
+
+    return table
+
+
+def _find_matching_period(results_by_time: list, canonical: dict) -> dict:
+    """Return the CE period whose start matches ``canonical`` (date-normalized), or empty groups."""
+    want = _period_start_date(canonical["TimePeriod"]["Start"])
+    for p in results_by_time:
+        if _period_start_date(p["TimePeriod"]["Start"]) == want:
+            return p
+    return {"TimePeriod": canonical["TimePeriod"], "Groups": []}
+
+
+def _period_service_amount_map(period: dict, metric: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for group in period.get("Groups") or []:
+        keys = group.get("Keys") or []
+        if not keys:
+            continue
+        name = keys[0]
+        out[name] = out.get(name, 0.0) + _metric_amount_raw(group, metric)
+    return out
+
+
+def create_service_record_type_split_table(
+    usage_period: dict,
+    credit_period: dict,
+    console_width: int,
+    top: int,
+    show_all: bool,
+    granularity: str,
+    metric: str,
+    record_type_for_period: dict[str, float] | None = None,
+    verbose: bool = False,
+) -> Table:
+    """
+    One monthly table: **Usage** from ``RECORD_TYPE=Usage`` × SERVICE; **Credits** from
+    ``RECORD_TYPE=Credit`` and ``Refund`` × SERVICE. Row amounts sum (by column) to the same
+    RECORD_TYPE totals as :func:`rollup_record_type_totals` for that month, apart from line items
+    not allocated to SERVICE (e.g. some tax rows).
+    """
+    usage_map = _period_service_amount_map(usage_period, metric)
+    credit_map = _period_service_amount_map(credit_period, metric)
+
+    period_start = usage_period["TimePeriod"]["Start"]
+    period_display = format_date_period(period_start, granularity)
+
+    if granularity == "DAILY":
+        title_prefix = "Daily"
+    elif granularity == "HOURLY":
+        title_prefix = "Hourly"
+    else:
+        title_prefix = "Monthly"
+
+    is_in_progress = should_show_in_progress(period_start, granularity)
+
+    rows: list[tuple[str, float, float]] = []
+    for name in sorted(set(usage_map) | set(credit_map)):
+        u = float(usage_map.get(name, 0.0))
+        c = float(credit_map.get(name, 0.0))
+        rows.append((name, u, c))
+
+    def _row_weight(item: tuple[str, float, float]) -> float:
+        _, u, c = item
+        return max(u, abs(c))
+
+    rows.sort(key=_row_weight, reverse=True)
+
+    total_count = len(rows)
+    non_zero_count = sum(
+        1 for _, u, c in rows if abs(u) >= 0.01 or abs(c) >= 0.01,
+    )
+    zero_count = total_count - non_zero_count
+
+    if top > 0:
+        rows = rows[:top]
+
+    if show_all or zero_count == 0:
+        title_core = f"{title_prefix} {period_display} Costs"
+    else:
+        title_core = (
+            f"{title_prefix} {period_display} Costs "
+            f"[dim]• Showing {non_zero_count} of {total_count} services "
+            f"(hidden: {zero_count} near-zero gross lines)[/dim]"
+        )
+
+    if is_in_progress:
+        title = f"{title_core} [yellow](In Progress)[/yellow]"
+    else:
+        title = title_core
+
+    title += " [dim]· by service (RECORD_TYPE Usage / Credits)[/dim]"
+
+    table = Table(title=title, expand=True)
+    table.add_column("Service", style="cyan")
+    table.add_column("Usage (REC)", justify="right", style="red")
+    table.add_column("Credits (REC)", justify="right", style="green")
+    table.add_column("Bar (red=paid · green=credits)", ratio=1)
+
+    displayed = [
+        (n, u, c)
+        for n, u, c in rows
+        if show_all or abs(u) >= 0.01 or abs(c) >= 0.01
+    ]
+    pos_amts = [u for _, u, c in displayed if u > 0.01]
+    neg_amts = [c for _, u, c in displayed if c < -0.01]
+    max_pos = max(pos_amts, default=0.0)
+    max_neg = max((abs(a) for a in neg_amts), default=0.0)
+
+    for name, u, c in rows:
+        if not show_all and abs(u) < 0.01 and abs(c) < 0.01:
+            continue
+        usage_s = _format_net_usd(u) if u >= 0.005 else "—"
+        cred_s = _format_net_usd(c) if c <= -0.005 else "—"
+        bar_cell = _service_usage_credit_bar(u, c, max_pos, max_neg)
+        table.add_row(name, usage_s, cred_s, bar_cell)
+
+    if show_all and zero_count > 0:
+        table.caption = f"Showing all services including {zero_count} with near-zero Usage and Credits"
+
+    if verbose:
+        cap_bits = [
+            "Columns: [red]Usage (REC)[/red] = SERVICE × RECORD_TYPE Usage; "
+            "[green]Credits (REC)[/green] = SERVICE × (Credit + Refund). "
+            "Bar: same dual-scale style as other service tables."
+        ]
+        if record_type_for_period:
+            u = record_type_for_period.get("Usage")
+            cr = record_type_for_period.get("Credit", 0.0) + record_type_for_period.get(
+                "Refund", 0.0
+            )
+            if u is not None and abs(float(u)) >= 0.005:
+                cap_bits.append(
+                    "Period RECORD_TYPE totals: Usage "
+                    f"[red]{_format_net_usd(float(u))}[/red] • Credits/refunds "
+                    f"[green]{_format_net_usd(float(cr))}[/green]."
+                )
+        join = " ".join(cap_bits)
+        table.caption = f"{table.caption}\n{join}" if table.caption else join
+
+    if is_in_progress:
+        note = "[yellow]Note: This month is still in progress. Data may be incomplete.[/yellow]"
+        table.caption = f"{table.caption}\n{note}" if table.caption else note
 
     return table
 
@@ -985,6 +1128,7 @@ def analyze_costs_detailed(
     region: str | None = None,
     metric_preference: str = "auto",
     reconcile: bool = True,
+    verbose: bool = False,
     ce_api_dump: list[dict] | None = None,
     out_summary: dict | None = None,
 ) -> None:
@@ -1164,10 +1308,11 @@ def analyze_costs_detailed(
 
             table.add_row(service_name, usage_type, usage_s, cred_s, bar_cell)
 
-        table.caption = (
-            "Same bar style as SERVICE: [red]red[/red]=paid vs max, "
-            "[green]green[/green]=credits vs max |credit|."
-        )
+        if verbose:
+            table.caption = (
+                "Same bar style as SERVICE: [red]red[/red]=paid vs max, "
+                "[green]green[/green]=credits vs max |credit|."
+            )
 
         console.print(table)
 
@@ -1189,7 +1334,14 @@ def analyze_costs_detailed(
         for period in region_data["ResultsByTime"]:
             # Create and display monthly table
             table = create_cost_table(
-                period, console.width, "REGION", top, show_all, granularity, display_metric
+                period,
+                console.width,
+                "REGION",
+                top,
+                show_all,
+                granularity,
+                display_metric,
+                verbose=verbose,
             )
             console.print(table)
 
@@ -1260,15 +1412,16 @@ def analyze_costs_detailed(
         _monthly_rec_usage_credit_bar(grand_usage_rt, grand_cred_rt, console.width),
     )
 
-    summary_table.caption = (
-        "[dim]Net = SERVICE lines; Usage (REC) / Credits (REC) = RECORD_TYPE (Billing MTD). "
-        "Bar: [red]red[/red] = net after credits vs (net+|credits|); "
-        "[green]green[/green] = |credits| share.[/dim]"
-    )
+    if verbose:
+        summary_table.caption = (
+            "[dim]Net = SERVICE lines; Usage (REC) / Credits (REC) = RECORD_TYPE (Billing MTD). "
+            "Bar: [red]red[/red] = net after credits vs (net+|credits|); "
+            "[green]green[/green] = |credits| share.[/dim]"
+        )
 
     console.print(summary_table)
 
-    if reconcile:
+    if reconcile and verbose:
         print_ce_reconciliation(
             console,
             start_date,
@@ -1334,13 +1487,13 @@ def get_cost_reduction_tip(service_name: str) -> str | None:
     return None
 
 
-_RECON_METRIC_COLUMNS: list[tuple[str, str]] = [
-    ("Unblended", "UnblendedCost"),
-    ("Blended", "BlendedCost"),
-    ("NetUnbl", "NetUnblendedCost"),
-    ("Amort", "AmortizedCost"),
-    ("NetAmort", "NetAmortizedCost"),
-]
+_RECON_METRIC_DISPLAY: dict[str, str] = {
+    "UnblendedCost": "Unblended",
+    "BlendedCost": "Blended",
+    "NetUnblendedCost": "Net unblended",
+    "AmortizedCost": "Amortized",
+    "NetAmortizedCost": "Net amortized",
+}
 
 
 def print_ce_reconciliation(
@@ -1392,36 +1545,47 @@ def print_ce_reconciliation(
         ce_api_dump=ce_api_dump,
         ce_api_label="reconcile:record_type",
     )
-    dm_rt = resolve_effective_metric(rt_payload["ResultsByTime"], metric_preference)
+    rt_periods = rt_payload.get("ResultsByTime", [])
+    dm_rt = resolve_effective_metric(rt_periods, metric_preference)
+    dm_ungrouped = resolve_effective_metric(periods, metric_preference)
+    dm_label = _RECON_METRIC_DISPLAY.get(dm_ungrouped, dm_ungrouped)
 
     cred_by_period_start: dict[str, float] = {}
-    for period in rt_payload.get("ResultsByTime", []):
+    usage_by_period_start: dict[str, float] = {}
+    for period in rt_periods:
         ts = period["TimePeriod"]["Start"]
         p_rt = rollup_record_type_totals([period], dm_rt)
-        cred_by_period_start[ts] = float(p_rt.get("Credit", 0.0)) + float(p_rt.get("Refund", 0.0))
+        cred_by_period_start[ts] = float(p_rt.get("Credit", 0.0)) + float(
+            p_rt.get("Refund", 0.0)
+        )
+        usage_by_period_start[ts] = float(p_rt.get("Usage", 0.0))
 
-    t_api = Table(title="Ungrouped CE Total (API Total block per period)", expand=True)
+    t_api = Table(
+        title=f"Ungrouped Cost Explorer (net = API Total, {dm_label} — same as this run)",
+        expand=True,
+    )
     t_api.add_column("Period", style="cyan", no_wrap=True)
-    t_api.add_column("Credit (REC)", justify="right")
-    for short, _full in _RECON_METRIC_COLUMNS:
-        t_api.add_column(short, justify="right")
+    t_api.add_column(f"Net ({dm_label})", justify="right")
+    t_api.add_column("Usage (REC)", justify="right", style="red")
+    t_api.add_column("Credits+refund (REC)", justify="right", style="green")
+    t_api.caption = (
+        f"[dim]Per-period [bold]Net[/bold] uses {dm_ungrouped!s} on the ungrouped CE response. "
+        f"RECORD_TYPE [bold]Usage[/bold] / [bold]Credits[/bold] are gross components (often large "
+        f"and offsetting; net is small). Unblended $0.00 in old-style tables is common when the "
+        f"account nets to ~$0; use Net and REC columns.[/dim]"
+    )
 
     for period in periods:
         ts = period["TimePeriod"]["Start"]
-        cred = cred_by_period_start.get(ts, 0.0)
-        row: list[str] = [
+        net = _period_metric_total(period, dm_ungrouped)
+        u = usage_by_period_start.get(ts, 0.0)
+        cr = cred_by_period_start.get(ts, 0.0)
+        t_api.add_row(
             format_date_period(ts, granularity),
-            _rich_usd_positive_red_negative_green(cred),
-        ]
-        tot = period.get("Total") or {}
-        for _short, full in _RECON_METRIC_COLUMNS:
-            block = tot.get(full) or {}
-            amt = block.get("Amount")
-            if amt in (None, ""):
-                row.append("—")
-            else:
-                row.append(_rich_usd_positive_red_negative_green(float(amt)))
-        t_api.add_row(*row)
+            _rich_usd_positive_red_negative_green(net),
+            _format_net_usd(u),
+            _format_net_usd(cr),
+        )
 
     console.print(t_api)
 
@@ -1452,6 +1616,7 @@ def analyze_costs_simple(
     region: str | None = None,
     metric_preference: str = "auto",
     reconcile: bool = True,
+    verbose: bool = False,
     ce_api_dump: list[dict] | None = None,
     out_summary: dict | None = None,
 ) -> None:
@@ -1596,6 +1761,7 @@ def analyze_costs_simple(
             granularity,
             display_metric,
             record_type_for_period=p_rt,
+            verbose=verbose,
         )
         console.print(table)
 
@@ -1635,12 +1801,13 @@ def analyze_costs_simple(
         _monthly_rec_usage_credit_bar(grand_usage_rt, grand_cred_rt, console.width),
     )
 
-    summary_table.caption = (
-        "[dim]Net = sum of SERVICE lines (often ~$0 after credits). "
-        "Usage (REC) / Credits (REC) = Cost Explorer RECORD_TYPE (Billing MTD). "
-        "Bar: [red]red[/red] = net after credits vs (net+|credits|); "
-        "[green]green[/green] = |credits| share.[/dim]"
-    )
+    if verbose:
+        summary_table.caption = (
+            "[dim]Net = sum of SERVICE lines (often ~$0 after credits). "
+            "Usage (REC) / Credits (REC) = Cost Explorer RECORD_TYPE (Billing MTD). "
+            "Bar: [red]red[/red] = net after credits vs (net+|credits|); "
+            "[green]green[/green] = |credits| share.[/dim]"
+        )
 
     console.print(summary_table)
 
@@ -1682,7 +1849,7 @@ def analyze_costs_simple(
             if tip:
                 console.print(f"  [yellow]Tip:[/yellow] {tip}")
 
-    if reconcile:
+    if reconcile and verbose:
         print_ce_reconciliation(
             console,
             start_date,

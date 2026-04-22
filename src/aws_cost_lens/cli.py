@@ -112,14 +112,22 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help=(
+            "Extra output: per-table bar/RECORD_TYPE captions, monthly summary legend, and the "
+            "reconciliation section (ungrouped CE + RECORD_TYPE table). Default is a quieter view."
+        ),
+    )
+    parser.add_argument(
         "--no-reconcile",
         action="store_false",
         dest="reconcile",
         default=True,
         help=(
-            "Skip the final reconciliation section (ungrouped CE totals + full RECORD_TYPE table). "
-            "Slightly faster and fewer Cost Explorer calls; the main report still includes RECORD_TYPE "
-            "rollup lines when applicable."
+            "When used with --verbose, skip reconciliation CE calls and that section entirely. "
+            "Ignored when not verbose (reconciliation is verbose-only)."
         ),
     )
     parser.add_argument(
@@ -210,6 +218,7 @@ def main():
                 region=args.region,
                 metric_preference=args.metric,
                 reconcile=args.reconcile,
+                verbose=args.verbose,
                 ce_api_dump=ce_api_dump,
                 out_summary=ce_out_summary,
             )
@@ -225,6 +234,7 @@ def main():
                 region=args.region,
                 metric_preference=args.metric,
                 reconcile=args.reconcile,
+                verbose=args.verbose,
                 ce_api_dump=ce_api_dump,
                 out_summary=ce_out_summary,
             )
