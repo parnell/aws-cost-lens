@@ -11,7 +11,14 @@ from datetime import datetime, timedelta
 
 from aws_cost_lens.core import analyze_costs_detailed, analyze_costs_simple, list_available_services
 
-METRIC_CHOICES = ("auto", "unblended", "blended", "net-unblended")
+METRIC_CHOICES = (
+    "auto",
+    "unblended",
+    "blended",
+    "net-unblended",
+    "amortized",
+    "net-amortized",
+)
 
 
 def parse_args():
@@ -20,7 +27,14 @@ def parse_args():
     parser.add_argument(
         "-s", "--start-date", help="Start date (YYYY-MM-DD), defaults to 6 months ago"
     )
-    parser.add_argument("-e", "--end-date", help="End date (YYYY-MM-DD), defaults to today")
+    parser.add_argument(
+        "-e",
+        "--end-date",
+        help=(
+            "End date (YYYY-MM-DD). Cost Explorer uses an exclusive end; omitting this defaults "
+            "to tomorrow so totals include usage through today (same window as most console views)."
+        ),
+    )
     parser.add_argument(
         "--service",
         default=None,
@@ -82,10 +96,22 @@ def parse_args():
     parser.add_argument(
         "--metric",
         choices=METRIC_CHOICES,
-        default="auto",
+        default="unblended",
         help=(
-            "Cost Explorer metric: auto (default) picks the strongest of Unblended / Blended / "
-            "NetUnblended for the date range; or force unblended, blended, or net-unblended"
+            "Cost Explorer metric: default unblended (typical usage charges). Use auto to pick "
+            "the bundled metric with the largest |total|, or force blended, net-unblended, "
+            "amortized, or net-amortized"
+        ),
+    )
+    parser.add_argument(
+        "--no-reconcile",
+        action="store_false",
+        dest="reconcile",
+        default=True,
+        help=(
+            "Skip the final reconciliation section (ungrouped CE totals + full RECORD_TYPE table). "
+            "Slightly faster and fewer Cost Explorer calls; the main report still includes RECORD_TYPE "
+            "rollup lines when applicable."
         ),
     )
     return parser.parse_args()
@@ -109,11 +135,11 @@ def main():
         else:
             start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
 
-        # Default to today if no end date provided
+        # CE TimePeriod.End is exclusive; default to tomorrow so "through today" is included.
         if args.end_date:
             end_date = args.end_date
         else:
-            end_date = datetime.now().strftime("%Y-%m-%d")
+            end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
         # If user requested to list services, do that and exit
         if args.list_services:
@@ -135,6 +161,7 @@ def main():
                 granularity=args.granularity,
                 region=args.region,
                 metric_preference=args.metric,
+                reconcile=args.reconcile,
             )
         else:
             analyze_costs_simple(
@@ -146,6 +173,7 @@ def main():
                 granularity=args.granularity,
                 region=args.region,
                 metric_preference=args.metric,
+                reconcile=args.reconcile,
             )
 
         return 0

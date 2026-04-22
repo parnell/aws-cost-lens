@@ -7,21 +7,28 @@ Core functionality for displaying AWS costs by service and usage type with rich 
 import sys
 from datetime import datetime
 from enum import Enum
-from typing import NamedTuple, Union, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import boto3
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress
 from rich.table import Table
+from rich.text import Text
 
 # AWS Cost Explorer limits
 MAX_HOURLY_GRANULARITY_DAYS = 14
 
-# When the user does not force a metric (`auto`), we pick whichever of these has the largest
-# total for the response. Some accounts return all zeros for UnblendedCost only; others for
-# BlendedCost. Requesting all three in one API call avoids wrong or empty results.
-CE_METRICS_BUNDLE = ["UnblendedCost", "BlendedCost", "NetUnblendedCost"]
+# Request these in one GetCostAndUsage call. Unblended / Blended / NetUnblended are the
+# classic cash-style metrics; Amortized / NetAmortized spread RI and Savings Plans commitment
+# across usage (often what the Cost Management console shows by default).
+CE_METRICS_BUNDLE = [
+    "UnblendedCost",
+    "BlendedCost",
+    "NetUnblendedCost",
+    "AmortizedCost",
+    "NetAmortizedCost",
+]
 
 # Fallback display metric if every bundled metric sums to zero.
 DEFAULT_COST_METRIC = "UnblendedCost"
@@ -32,7 +39,19 @@ COST_METRIC_ALIASES: dict[str, str] = {
     "unblended": "UnblendedCost",
     "blended": "BlendedCost",
     "net-unblended": "NetUnblendedCost",
+    "amortized": "AmortizedCost",
+    "net-amortized": "NetAmortizedCost",
 }
+
+# When ``metric_preference`` is ``auto``, we pick the metric with the largest |total| across
+# the response. Tie-break prefers console-like amortized metrics, then unblended-style.
+_METRIC_AUTO_ORDER = [
+    "NetAmortizedCost",
+    "AmortizedCost",
+    "UnblendedCost",
+    "NetUnblendedCost",
+    "BlendedCost",
+]
 
 
 def get_account_header_markup() -> str:
@@ -109,11 +128,131 @@ def _period_metric_total(period: dict, metric: str) -> float:
     return sum(_metric_amount_raw(g, metric) for g in period.get("Groups", []))
 
 
+def _period_charges_and_credits(period: dict, metric: str) -> tuple[float, float]:
+    """
+    Split group amounts into positive charges vs credits/refunds (negative lines).
+
+    Returns (charges, credits) where credits is a non-positive sum (e.g. -60.81).
+    """
+    charges = 0.0
+    credits = 0.0
+    for g in period.get("Groups", []):
+        a = _metric_amount_raw(g, metric)
+        if a > 0:
+            charges += a
+        elif a < 0:
+            credits += a
+    return charges, credits
+
+
+def rollup_net_charges_credits(results_by_time: list, metric: str) -> tuple[float, float, float]:
+    """Net total, sum of positive lines, sum of negative lines across all periods."""
+    net = 0.0
+    charges = 0.0
+    credits = 0.0
+    for period in results_by_time:
+        net += _period_metric_total(period, metric)
+        c, cr = _period_charges_and_credits(period, metric)
+        charges += c
+        credits += cr
+    return net, charges, credits
+
+
+def rollup_record_type_totals(results_by_time: list, metric: str) -> dict[str, float]:
+    """Sum amounts by Cost Explorer RECORD_TYPE (Usage, Credit, Tax, Refund, …)."""
+    out: dict[str, float] = {}
+    for period in results_by_time:
+        for g in period.get("Groups", []):
+            key = (g.get("Keys") or ["?"])[0]
+            out[key] = out.get(key, 0.0) + _metric_amount_raw(g, metric)
+    return out
+
+
 def _format_net_usd(value: float) -> str:
     """Format a net dollar amount; near-zero floats print as $0.00."""
     if abs(value) < 0.005:
         return "$0.00"
     return f"${value:.2f}"
+
+
+def _split_usage_credit(amount: float) -> Tuple[float, float]:
+    """Split a signed SERVICE line into positive usage vs non-positive credits (CE convention)."""
+    if amount > 0.01:
+        return amount, 0.0
+    if amount < -0.01:
+        return 0.0, amount
+    return 0.0, 0.0
+
+
+def _format_usage_credit_cells(amount: float) -> Tuple[str, str]:
+    """Two display cells: Usage (≥0) and Credits (≤0 or —)."""
+    u, c = _split_usage_credit(amount)
+    if abs(amount) < 0.005:
+        return "$0.00", "—"
+    usage_s = _format_net_usd(u) if u > 0 else "—"
+    cred_s = _format_net_usd(c) if c < 0 else "—"
+    return usage_s, cred_s
+
+
+def _service_usage_credit_bar(
+    usage: float,
+    credit: float,
+    max_pos: float,
+    max_neg: float,
+    half_chars: int = 20,
+) -> Text:
+    """
+    One bar cell: **red** = usage (what you paid) vs table max usage; **green** = |credit| vs max |credit|.
+    """
+    t = Text()
+    wrote = False
+    if max_pos > 1e-12 and usage > 1e-12:
+        n = max(1, min(half_chars, round((usage / max_pos) * half_chars)))
+        t.append("█" * n, style="red")
+        wrote = True
+    if max_neg > 1e-12 and credit < -1e-12:
+        n = max(1, min(half_chars, round((abs(credit) / max_neg) * half_chars)))
+        if wrote:
+            t.append(" ", style="dim")
+        t.append("█" * n, style="green")
+        wrote = True
+    if not wrote:
+        t.append("—", style="dim")
+    return t
+
+
+def _monthly_rec_usage_credit_bar(
+    usage_rec: float,
+    credits_rec: float,
+    console_width: int,
+) -> Text:
+    """
+    RECORD_TYPE summary bar: **red** = Usage (paid); **green** = |Credits| (credits applied).
+    Width of each segment is proportional to its share of (Usage + |Credits|).
+    """
+    u = max(0.0, usage_rec)
+    c_abs = abs(min(0.0, credits_rec))
+    t = Text()
+    W = max(12, min(40, int(console_width / 3)))
+    if u < 1e-9 and c_abs < 1e-9:
+        t.append("—", style="dim")
+        return t
+    tot = u + c_abs
+    if tot < 1e-12:
+        t.append("—", style="dim")
+        return t
+    n_paid = max(1, round(W * (u / tot)))
+    n_cred = W - n_paid
+    if n_cred < 1:
+        n_cred = 1
+        n_paid = W - 1
+    t.append("█" * n_paid, style="red")
+    t.append("█" * n_cred, style="green")
+    t.append(
+        f"  {100 * u / tot:.0f}% paid · {100 * c_abs / tot:.0f}% credits",
+        style="dim",
+    )
+    return t
 
 
 def _monthly_summary_bar(total: float, max_abs: float, console_width: int) -> str:
@@ -149,9 +288,7 @@ def resolve_effective_metric(results_by_time: list, metric_preference: str) -> s
     for period in results_by_time:
         for m in CE_METRICS_BUNDLE:
             totals[m] += abs(_period_metric_total(period, m))
-    # Prefer Unblended, then NetUnblended, then Blended when totals tie at 0 (or equal).
-    order = ["UnblendedCost", "NetUnblendedCost", "BlendedCost"]
-    return max(order, key=lambda k: (totals[k], -order.index(k)))
+    return max(_METRIC_AUTO_ORDER, key=lambda k: (totals[k], -_METRIC_AUTO_ORDER.index(k)))
 
 
 class ServiceInfo(NamedTuple):
@@ -230,18 +367,24 @@ def get_cost_data(
     start_date: str,
     end_date: str,
     service: Optional[str],
-    group_by: Union[str, list[str]],
+    group_by: Optional[Union[str, list[str]]],
     granularity: str = "MONTHLY",
     region: Optional[str] = None,
 ) -> dict:
-    """Fetch cost data from AWS Cost Explorer API."""
+    """
+    Fetch cost data from AWS Cost Explorer API.
+
+    If ``group_by`` is ``None``, ``GetCostAndUsage`` is called **without** ``GroupBy`` so each
+    period includes the API ``Total`` block (official per-period totals for the bundled metrics).
+    """
     console = Console()
 
     with Progress() as progress:
-        task = progress.add_task(
-            f"[cyan]Fetching AWS costs{f' for {service}' if service else ''}...",
-            total=1,
-        )
+        label = f" for {service}" if service else ""
+        if group_by is None:
+            task = progress.add_task(f"[cyan]Fetching AWS account totals{label}...", total=1)
+        else:
+            task = progress.add_task(f"[cyan]Fetching AWS costs{label}...", total=1)
 
         try:
             ce_client = boto3.client("ce")
@@ -288,11 +431,11 @@ def get_cost_data(
                 "Metrics": list(CE_METRICS_BUNDLE),
             }
 
-            # Handle single string or list of group_by values
-            if isinstance(group_by, str):
-                request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": group_by}]
-            else:
-                request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": key} for key in group_by]
+            if group_by is not None:
+                if isinstance(group_by, str):
+                    request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": group_by}]
+                else:
+                    request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": key} for key in group_by]
 
             # Add service filter if specified
             if service or region:
@@ -439,8 +582,17 @@ def create_cost_table(
     show_all: bool = False,
     granularity: str = "MONTHLY",
     metric: str = DEFAULT_COST_METRIC,
+    record_type_for_period: Optional[Dict[str, float]] = None,
 ) -> Table:
-    """Create a rich table for a single time period."""
+    """Create a rich table for a single time period.
+
+    When costs mix large credits on one SERVICE line with smaller usage lines, a single |max|
+    makes bars misleading. We scale **positive** rows against the largest positive line and
+    **negative** rows against the largest |negative| line.
+
+    ``record_type_for_period`` (Usage / Credit / …) adds a caption tying SERVICE rows to
+    CE’s billing-style RECORD_TYPE totals for the same window.
+    """
     period_start = period_data["TimePeriod"]["Start"]
     period_display = format_date_period(period_start, granularity)
 
@@ -453,14 +605,8 @@ def create_cost_table(
 
     title = f"{title_prefix} {period_display} Costs"
 
-    # Calculate monthly total to check if this is an in-progress month
-    monthly_total = 0.0
-    for group in period_data.get("Groups", []):
-        amount = _metric_amount(group, metric)
-        monthly_total += amount
-
-    # Check if this is an in-progress month
-    is_in_progress = should_show_in_progress(period_start, monthly_total)
+    # Calendar-based provisional period (MTD etc.), not tied to whether net spend is $0.
+    is_in_progress = should_show_in_progress(period_start, granularity)
 
     # Modify title for in-progress months
     if is_in_progress:
@@ -508,15 +654,22 @@ def create_cost_table(
 
     table = Table(title=title, expand=True)
     table.add_column(group_title, style="cyan")
-    table.add_column("Cost", justify="right", style="green")
-    table.add_column("Distribution (% of max)", ratio=1)
+    table.add_column("Usage", justify="right", style="red")
+    table.add_column("Credits", justify="right", style="green")
+    table.add_column("Bar (red=paid · green=credits)", ratio=1)
 
     # Check if there's any data
     if not period_data.get("Groups"):
         if is_in_progress:
-            table.add_row("In Progress", "[yellow]Data not yet available[/yellow]", "")
+            table.add_row(
+                "In Progress",
+                "[yellow]Data not yet available[/yellow]",
+                "",
+                "",
+                "",
+            )
         else:
-            table.add_row("No data found", "$0.00", "")
+            table.add_row("No data found", "$0.00", "—", "—", "")
         return table
 
     # Sort by cost (highest first)
@@ -526,8 +679,12 @@ def create_cost_table(
     if limit > 0:
         costs = costs[:limit]
 
-    # Find max cost for bar scaling (use magnitude so credits/negatives still render)
-    max_cost = max([abs(c) for _, c in costs], default=0)
+    displayed = [(n, a) for n, a in costs if show_all or abs(a) >= 0.01]
+    pos_amts = [a for _, a in displayed if a > 0.01]
+    neg_amts = [a for _, a in displayed if a < -0.01]
+    max_pos = max(pos_amts, default=0.0)
+    max_neg = max((abs(a) for a in neg_amts), default=0.0)
+    max_abs_all = max((abs(c) for _, c in displayed), default=0.0)
 
     # Add rows
     for name, amount in costs:
@@ -535,36 +692,32 @@ def create_cost_table(
         if abs(amount) < 0.01 and not show_all:
             continue
 
-        # Calculate bar length (max is console width / 2)
-        max_bar_width = console_width / 2
-        bar_width = 0
-        if max_cost > 0:
-            bar_width = round((abs(amount) / max_cost) * max_bar_width)
+        u, c = _split_usage_credit(amount)
+        usage_s, cred_s = _format_usage_credit_cells(amount)
+        bar_cell = _service_usage_credit_bar(u, c, max_pos, max_neg)
 
-        # Create a progress bar with percentage
-        bar = "█" * bar_width
-
-        # For items that are a fraction of max cost, add percentage label
-        if max_cost > 0:
-            MAX_PERCENTAGE = 100
-            percentage = (abs(amount) / max_cost) * 100
-            # Only add percentage if not 100%
-            if percentage < MAX_PERCENTAGE:
-                bar = f"{bar} {percentage:.1f}%"
-            else:
-                bar = f"{bar} (max)"
-
-        table.add_row(name, f"${amount:.2f}", bar)
+        table.add_row(name, usage_s, cred_s, bar_cell)
 
     # If --show-all is being used, add a footnote
     if show_all and zero_count > 0:
         table.caption = f"Showing all items including {zero_count} with $0.00 cost"
 
-    # Add caption explaining the distribution
+    cap_bits = [
+        "Bar: [red]red[/red] = usage (paid) vs largest usage in table; [green]green[/green] = |credits| vs "
+        "largest |credit| line (separate scales side by side)."
+    ]
+    if group_by == "SERVICE" and record_type_for_period:
+        u = record_type_for_period.get("Usage")
+        cr = record_type_for_period.get("Credit", 0.0) + record_type_for_period.get("Refund", 0.0)
+        if u is not None and abs(u) >= 0.005:
+            cap_bits.append(
+                f"RECORD_TYPE for this period: Usage {_format_net_usd(u)} • "
+                f"Credits/refunds {_format_net_usd(cr)} (SERVICE rows allocate credits unevenly)."
+            )
     if table.caption:
-        table.caption += "\nDistribution bars show relative cost compared to the highest item"
+        table.caption += "\n" + " ".join(cap_bits)
     else:
-        table.caption = "Distribution bars show relative cost compared to the highest item"
+        table.caption = " ".join(cap_bits)
 
     # Add in-progress note to the caption if applicable
     if is_in_progress:
@@ -580,47 +733,49 @@ def create_cost_table(
     return table
 
 
-def should_show_in_progress(period_date: str, monthly_total: float) -> bool:
+def _period_start_date(period_date: str) -> str:
+    """Normalize CE TimePeriod.Start (possibly ISO) to YYYY-MM-DD."""
+    if "T" in period_date:
+        return period_date.split("T", 1)[0][:10]
+    return period_date[:10]
+
+
+def should_show_in_progress(period_date: str, granularity: str = "MONTHLY") -> bool:
     """
-    Determine if a month should be shown as 'In Progress'.
+    Whether this Cost Explorer bucket is still provisional (MTD, today, future, or invoice lag).
 
-    Args:
-        period_date: The start date of the period in 'YYYY-MM-DD' format.
-        monthly_total: The total cost for the month.
-
-    Returns:
-        bool: True if the month should show as 'In Progress', False otherwise.
+    This must not depend on dollar totals: a current month can net to $0 after credits and is
+    still month-to-date. Previously we treated any positive total as "complete", which hid MTD
+    labels and dropped totals from the summary.
     """
-    # Check if the total is effectively zero
-    if monthly_total > 0.01:
-        return False
-
-    # Get the period date as a datetime object
-    period_dt = datetime.strptime(period_date, "%Y-%m-%d")
-    period_month = period_dt.month
-    period_year = period_dt.year
-
-    # Get the current date
+    raw = _period_start_date(period_date)
+    period_dt = datetime.strptime(raw, "%Y-%m-%d")
     today = datetime.now()
-    current_month = today.month
-    current_year = today.year
 
-    # Current month should show as 'In Progress'
-    if period_year == current_year and period_month == current_month:
-        return True
-
-    # Special case: if this is the immediately previous month and we're in the early
-    # days of the current month (before the 5th), treat the previous month as 'In Progress' too
-    if (period_year == current_year and period_month == current_month - 1) or (
-        current_month == 1 and period_month == 12 and period_year == current_year - 1
-    ):
-        if today.day <= 5:  # Early days of the month
+    if granularity == "HOURLY":
+        if period_dt.date() > today.date():
             return True
+        return period_dt.date() == today.date()
 
-    # If it's future data or very recent, also mark as in progress
-    if period_year > current_year or (period_year == current_year and period_month > current_month):
+    if granularity == "DAILY":
+        if period_dt.date() > today.date():
+            return True
+        return period_dt.date() == today.date()
+
+    # MONTHLY: compare calendar (year, month) only — do not use datetime ordering on
+    # period-start-at-midnight vs "today.replace(day=1)" which keeps the clock time.
+    p_month = (period_dt.year, period_dt.month)
+    t_month = (today.year, today.month)
+
+    if p_month > t_month:
+        return True
+    if p_month == t_month:
         return True
 
+    # Closed past months — except the month immediately before today during invoice finalization
+    months_diff = (t_month[0] - p_month[0]) * 12 + (t_month[1] - p_month[1])
+    if months_diff == 1 and today.day <= 5:
+        return True
     return False
 
 
@@ -634,6 +789,7 @@ def analyze_costs_detailed(
     granularity: str = "MONTHLY",
     region: Optional[str] = None,
     metric_preference: str = "auto",
+    reconcile: bool = True,
 ) -> None:
     """Analyze costs with detailed breakdown by SERVICE, USAGE_TYPE, and optionally REGION."""
     console = Console()
@@ -686,7 +842,28 @@ def analyze_costs_detailed(
     if metric_preference == "auto":
         console.print(
             f"[dim]Using Cost Explorer metric: {display_metric} "
-            f"(picked from Unblended / Blended / NetUnblended totals)[/dim]"
+            f"(auto picks the largest |total| across bundled CE metrics)[/dim]"
+        )
+
+    rt_payload = get_cost_data(start_date, end_date, service, "RECORD_TYPE", granularity, region)
+    rt_by_type = rollup_record_type_totals(rt_payload["ResultsByTime"], display_metric)
+
+    net_roll, charges_roll, credits_roll = rollup_net_charges_credits(
+        cost_data["ResultsByTime"], display_metric
+    )
+    console.print(
+        f"[dim]Rollup (by SERVICE rows): net {_format_net_usd(net_roll)} • gross charges "
+        f"{_format_net_usd(charges_roll)} • credits/refunds {_format_net_usd(credits_roll)}[/dim]"
+    )
+    rt_parts = []
+    for key in ("Usage", "Credit", "Refund", "Tax", "Distributor Discount"):
+        if key in rt_by_type and abs(rt_by_type[key]) >= 0.005:
+            rt_parts.append(f"{key} {_format_net_usd(rt_by_type[key])}")
+    if rt_parts:
+        console.print(
+            "[dim]RECORD_TYPE (Billing home / CE “Usage vs credits” style): "
+            + " • ".join(rt_parts)
+            + "[/dim]"
         )
 
     # Display costs for each month
@@ -723,8 +900,9 @@ def analyze_costs_detailed(
         table = Table(title=title, expand=True)
         table.add_column("Service", style="cyan")
         table.add_column("Usage Type", style="green")
-        table.add_column("Cost", justify="right")
-        table.add_column("Distribution (% of max)", ratio=1)
+        table.add_column("Usage", justify="right", style="red")
+        table.add_column("Credits", justify="right", style="green")
+        table.add_column("Bar (red=paid · green=credits)", ratio=1)
 
         # Sort by cost (highest first)
         costs.sort(key=lambda x: x[2], reverse=True)
@@ -733,8 +911,11 @@ def analyze_costs_detailed(
         if top > 0:
             costs = costs[:top]
 
-        # Find max cost for bar scaling (magnitude)
-        max_cost = max([abs(c) for _, _, c in costs], default=0)
+        displayed_amts = [c for _, _, c in costs if show_all or abs(c) >= 0.01]
+        pos_amts = [a for a in displayed_amts if a > 0.01]
+        neg_amts = [a for a in displayed_amts if a < -0.01]
+        max_pos = max(pos_amts, default=0.0)
+        max_neg = max((abs(a) for a in neg_amts), default=0.0)
 
         # Add rows
         for service_name, usage_type, amount in costs:
@@ -742,28 +923,15 @@ def analyze_costs_detailed(
             if abs(amount) < 0.01 and not show_all:
                 continue
 
-            # Calculate bar length (max is console width / 2)
-            max_bar_width = console.width / 2
-            bar_width = 0
-            if max_cost > 0:
-                bar_width = round((abs(amount) / max_cost) * max_bar_width)
+            u, c = _split_usage_credit(amount)
+            usage_s, cred_s = _format_usage_credit_cells(amount)
+            bar_cell = _service_usage_credit_bar(u, c, max_pos, max_neg)
 
-            # Create a progress bar with percentage
-            bar = "█" * bar_width
+            table.add_row(service_name, usage_type, usage_s, cred_s, bar_cell)
 
-            # For items that are a fraction of max cost, add percentage label
-            if max_cost > 0:
-                percentage = (abs(amount) / max_cost) * 100
-                # Only add percentage if not 100%
-                if percentage < 100:
-                    bar = f"{bar} {percentage:.1f}%"
-                else:
-                    bar = f"{bar} (max)"
-
-            table.add_row(service_name, usage_type, f"${amount:.2f}", bar)
-
-        # Add caption explaining the distribution
-        table.caption = "Distribution bars show relative cost compared to the highest item"
+        table.caption = (
+            "Same bar style as SERVICE: [red]red[/red]=paid vs max, [green]green[/green]=credits vs max |credit|."
+        )
 
         console.print(table)
 
@@ -785,56 +953,71 @@ def analyze_costs_detailed(
 
     # Get service-level data for summary
     service_data = get_cost_data(start_date, end_date, service, "SERVICE", granularity, region)
+    rt_periods_d = rt_payload.get("ResultsByTime", [])
     monthly_totals = []
     grand_total = 0.0
+    grand_usage_rt = 0.0
+    grand_cred_rt = 0.0
 
-    for period in service_data["ResultsByTime"]:
+    for i, period in enumerate(service_data["ResultsByTime"]):
         monthly_total = _period_metric_total(period, display_metric)
 
-        # Get period information
         period_start = period["TimePeriod"]["Start"]
         month_name = format_date_period(period_start, granularity)
 
-        # Check if this month should be shown as "In Progress"
-        is_in_progress = should_show_in_progress(period_start, monthly_total)
+        p_rt = (
+            rollup_record_type_totals([rt_periods_d[i]], display_metric)
+            if i < len(rt_periods_d)
+            else {}
+        )
+        usage_rt = p_rt.get("Usage", 0.0)
+        cred_rt = p_rt.get("Credit", 0.0) + p_rt.get("Refund", 0.0)
 
-        if is_in_progress:
-            # Current or very recent month with minimal data - mark as in progress
-            monthly_totals.append((month_name, 0, True))
-        else:
-            # Regular month with data
-            grand_total += monthly_total
-            monthly_totals.append((month_name, monthly_total, False))
+        incomplete = should_show_in_progress(period_start, granularity)
+        grand_total += monthly_total
+        grand_usage_rt += usage_rt
+        grand_cred_rt += cred_rt
+        monthly_totals.append((month_name, monthly_total, incomplete, usage_rt, cred_rt))
 
     # Display summary table
     summary_table = Table(title="Monthly Summary", expand=True)
     summary_table.add_column("Month", style="cyan")
-    summary_table.add_column("Total Cost", justify="right", style="green")
-    summary_table.add_column("Distribution (% of max)", ratio=1)
+    summary_table.add_column("Net", justify="right", style="green")
+    summary_table.add_column("Usage (REC)", justify="right", style="red")
+    summary_table.add_column("Credits (REC)", justify="right", style="green")
+    summary_table.add_column("Bar (red=paid · green=credits)", ratio=1)
 
-    # Scale bars by largest |net| so months near $0 after credits still render sensibly
-    complete_monthly_costs = [total for _, total, in_progress in monthly_totals if not in_progress]
-    max_monthly_abs = max((abs(t) for t in complete_monthly_costs), default=0.0)
+    for month, total, incomplete, usage_rt, cred_rt in monthly_totals:
+        label = f"{month} [dim](MTD)[/dim]" if incomplete else month
+        bar = _monthly_rec_usage_credit_bar(usage_rt, cred_rt, console.width)
+        summary_table.add_row(
+            label,
+            _format_net_usd(total),
+            _format_net_usd(usage_rt),
+            _format_net_usd(cred_rt),
+            bar,
+        )
 
-    for month, total, in_progress in monthly_totals:
-        if in_progress:
-            # Show "In Progress" for months marked as in-progress
-            summary_table.add_row(month, "[yellow]In Progress[/yellow]", "")
-            continue
-
-        bar = _monthly_summary_bar(total, max_monthly_abs, console.width)
-        summary_table.add_row(month, _format_net_usd(total), bar)
-
-    # Add grand total row without bar
-    summary_table.add_row("GRAND TOTAL", _format_net_usd(grand_total), "", style="bold")
+    summary_table.add_row(
+        "GRAND TOTAL",
+        _format_net_usd(grand_total),
+        _format_net_usd(grand_usage_rt),
+        _format_net_usd(grand_cred_rt),
+        _monthly_rec_usage_credit_bar(grand_usage_rt, grand_cred_rt, console.width),
+        style="bold",
+    )
 
     summary_table.caption = (
-        "[dim]Monthly totals are Cost Explorer net amounts (all services in the period). "
-        "Credits or discounts on one line (often AWS Data Transfer) can offset usage elsewhere, "
-        "so the net can be ≈ $0 while per-service rows still show non-zero charges.[/dim]"
+        "[dim]Net = SERVICE lines; Usage (REC) / Credits (REC) = RECORD_TYPE (Billing MTD). "
+        "Bar: [red]red[/red] = share of Usage (paid), [green]green[/green] = share of |Credits|.[/dim]"
     )
 
     console.print(summary_table)
+
+    if reconcile:
+        print_ce_reconciliation(
+            console, start_date, end_date, service, region, granularity, metric_preference
+        )
 
 
 def get_cost_reduction_tip(service_name: str) -> Optional[str]:
@@ -883,6 +1066,81 @@ def get_cost_reduction_tip(service_name: str) -> Optional[str]:
     return None
 
 
+_RECON_METRIC_COLUMNS: List[Tuple[str, str]] = [
+    ("Unblended", "UnblendedCost"),
+    ("Blended", "BlendedCost"),
+    ("NetUnbl", "NetUnblendedCost"),
+    ("Amort", "AmortizedCost"),
+    ("NetAmort", "NetAmortizedCost"),
+]
+
+
+def print_ce_reconciliation(
+    console: Console,
+    start_date: str,
+    end_date: str,
+    service: Optional[str],
+    region: Optional[str],
+    granularity: str,
+    metric_preference: str,
+) -> None:
+    """
+    Show official CE ``Total`` lines (no GROUP BY) and a ``RECORD_TYPE`` breakdown.
+
+    AWS does not publish a separate public API for the Billing console “Cost summary” card or
+    finalized invoices; Cost Explorer is the supported usage/cost API. Invoice-style detail is
+    available via Cost & Usage Reports (S3) for accounts that enable CUR.
+    """
+    console.print("\n[bold]Reconciliation — Cost Explorer API only[/bold]")
+    console.print(
+        "[dim]There is no separate boto3 “billing dashboard” total. These rows are still "
+        "``ce:GetCostAndUsage``. Enable Cost & Usage Reports to S3 for invoice/CUR-aligned data.[/dim]"
+    )
+
+    totals_payload = get_cost_data(start_date, end_date, service, None, granularity, region)
+    periods = totals_payload.get("ResultsByTime") or []
+    if not periods:
+        console.print("[yellow]No ungrouped Cost Explorer data for this range.[/yellow]")
+        return
+
+    t_api = Table(title="Ungrouped CE Total (API Total block per period)", expand=True)
+    t_api.add_column("Period", style="cyan", no_wrap=True)
+    for short, _full in _RECON_METRIC_COLUMNS:
+        t_api.add_column(short, justify="right")
+
+    for period in periods:
+        ts = period["TimePeriod"]["Start"]
+        row: list[str] = [format_date_period(ts, granularity)]
+        tot = period.get("Total") or {}
+        for _short, full in _RECON_METRIC_COLUMNS:
+            block = tot.get(full) or {}
+            amt = block.get("Amount")
+            if amt in (None, ""):
+                row.append("—")
+            else:
+                row.append(_format_net_usd(float(amt)))
+        t_api.add_row(*row)
+
+    console.print(t_api)
+
+    rt_payload = get_cost_data(start_date, end_date, service, "RECORD_TYPE", granularity, region)
+    dm_rt = resolve_effective_metric(rt_payload["ResultsByTime"], metric_preference)
+    console.print(f"[dim]RECORD_TYPE breakdown uses metric: {dm_rt}[/dim]")
+
+    agg: dict[str, float] = {}
+    for period in rt_payload.get("ResultsByTime", []):
+        for g in period.get("Groups", []):
+            key = (g.get("Keys") or ["?"])[0]
+            agg[key] = agg.get(key, 0.0) + _metric_amount_raw(g, dm_rt)
+
+    rt_table = Table(title="By RECORD_TYPE (aggregated)", expand=True)
+    rt_table.add_column("RECORD_TYPE", style="cyan")
+    rt_table.add_column("Amount", justify="right", style="green")
+    for k in sorted(agg.keys(), key=lambda x: abs(agg[x]), reverse=True):
+        rt_table.add_row(k, _format_net_usd(agg[k]))
+    console.print(rt_table)
+
+
 def analyze_costs_simple(
     start_date: str,
     end_date: str,
@@ -892,6 +1150,7 @@ def analyze_costs_simple(
     granularity: str = "MONTHLY",
     region: Optional[str] = None,
     metric_preference: str = "auto",
+    reconcile: bool = True,
 ) -> None:
     """Simple cost analysis view."""
     console = Console()
@@ -935,94 +1194,144 @@ def analyze_costs_simple(
     if metric_preference == "auto":
         console.print(
             f"[dim]Using Cost Explorer metric: {display_metric} "
-            f"(picked from Unblended / Blended / NetUnblended totals)[/dim]"
+            f"(auto picks the largest |total| across bundled CE metrics)[/dim]"
+        )
+
+    rt_payload = get_cost_data(start_date, end_date, service, "RECORD_TYPE", granularity, region)
+    rt_by_type = rollup_record_type_totals(rt_payload["ResultsByTime"], display_metric)
+    rt_periods_list = rt_payload.get("ResultsByTime", [])
+
+    net_roll, charges_roll, credits_roll = rollup_net_charges_credits(
+        cost_data["ResultsByTime"], display_metric
+    )
+    console.print(
+        f"[dim]Rollup (by SERVICE rows): net {_format_net_usd(net_roll)} • gross charges "
+        f"{_format_net_usd(charges_roll)} • credits/refunds {_format_net_usd(credits_roll)}[/dim]"
+    )
+    rt_parts = []
+    for key in ("Usage", "Credit", "Refund", "Tax", "Distributor Discount"):
+        if key in rt_by_type and abs(rt_by_type[key]) >= 0.005:
+            rt_parts.append(f"{key} {_format_net_usd(rt_by_type[key])}")
+    if rt_parts:
+        console.print(
+            "[dim]RECORD_TYPE (Billing home / CE “Usage vs credits” style): "
+            + " • ".join(rt_parts)
+            + "[/dim]"
         )
 
     # Display costs for each month
     grand_total = 0.0
+    grand_usage_rt = 0.0
+    grand_cred_rt = 0.0
     monthly_totals = []
 
-    for period in cost_data["ResultsByTime"]:
+    cost_periods = cost_data["ResultsByTime"]
+    for i, period in enumerate(cost_periods):
         monthly_total = _period_metric_total(period, display_metric)
 
-        # Create and display monthly table
+        p_rt = (
+            rollup_record_type_totals([rt_periods_list[i]], display_metric)
+            if i < len(rt_periods_list)
+            else {}
+        )
+        usage_rt = p_rt.get("Usage", 0.0)
+        cred_rt = p_rt.get("Credit", 0.0) + p_rt.get("Refund", 0.0)
+
         table = create_cost_table(
-            period, console.width, "SERVICE", top, show_all, granularity, display_metric
+            period,
+            console.width,
+            "SERVICE",
+            top,
+            show_all,
+            granularity,
+            display_metric,
+            record_type_for_period=p_rt,
         )
         console.print(table)
 
-        # Get period information
         period_start = period["TimePeriod"]["Start"]
         month_name = format_date_period(period_start, granularity)
 
-        # Check if this month should be shown as "In Progress"
-        is_in_progress = should_show_in_progress(period_start, monthly_total)
-
-        if is_in_progress:
-            # Current or very recent month with minimal data - mark as in progress
-            monthly_totals.append((month_name, 0, True))
-        else:
-            # Regular month with data
-            grand_total += monthly_total
-            monthly_totals.append((month_name, monthly_total, False))
+        incomplete = should_show_in_progress(period_start, granularity)
+        grand_total += monthly_total
+        grand_usage_rt += usage_rt
+        grand_cred_rt += cred_rt
+        monthly_totals.append((month_name, monthly_total, incomplete, usage_rt, cred_rt))
 
     # Display summary table
     summary_table = Table(title="Monthly Summary", expand=True)
     summary_table.add_column("Month", style="cyan")
-    summary_table.add_column("Total Cost", justify="right", style="green")
-    summary_table.add_column("Distribution (% of max)", ratio=1)
+    summary_table.add_column("Net", justify="right", style="green")
+    summary_table.add_column("Usage (REC)", justify="right", style="red")
+    summary_table.add_column("Credits (REC)", justify="right", style="green")
+    summary_table.add_column("Bar (red=paid · green=credits)", ratio=1)
 
-    # Scale bars by largest |net| so months near $0 after credits still render sensibly
-    complete_monthly_costs = [total for _, total, in_progress in monthly_totals if not in_progress]
-    max_monthly_abs = max((abs(t) for t in complete_monthly_costs), default=0.0)
+    for month, total, incomplete, usage_rt, cred_rt in monthly_totals:
+        label = f"{month} [dim](MTD)[/dim]" if incomplete else month
+        bar = _monthly_rec_usage_credit_bar(usage_rt, cred_rt, console.width)
+        summary_table.add_row(
+            label,
+            _format_net_usd(total),
+            _format_net_usd(usage_rt),
+            _format_net_usd(cred_rt),
+            bar,
+        )
 
-    for month, total, in_progress in monthly_totals:
-        if in_progress:
-            # Show "In Progress" for months marked as in-progress
-            summary_table.add_row(month, "[yellow]In Progress[/yellow]", "")
-            continue
-
-        bar = _monthly_summary_bar(total, max_monthly_abs, console.width)
-        summary_table.add_row(month, _format_net_usd(total), bar)
-
-    # Add grand total row without bar
-    summary_table.add_row("GRAND TOTAL", _format_net_usd(grand_total), "", style="bold")
+    summary_table.add_row(
+        "GRAND TOTAL",
+        _format_net_usd(grand_total),
+        _format_net_usd(grand_usage_rt),
+        _format_net_usd(grand_cred_rt),
+        _monthly_rec_usage_credit_bar(grand_usage_rt, grand_cred_rt, console.width),
+        style="bold",
+    )
 
     summary_table.caption = (
-        "[dim]Monthly totals are Cost Explorer net amounts (all services in the period). "
-        "Credits or discounts on one line (often AWS Data Transfer) can offset usage elsewhere, "
-        "so the net can be ≈ $0 while per-service rows still show non-zero charges.[/dim]"
+        "[dim]Net = sum of SERVICE lines (often ~$0 after credits). "
+        "Usage (REC) / Credits (REC) = Cost Explorer RECORD_TYPE (Billing MTD). "
+        "Bar: [red]red[/red] = share of Usage (paid), [green]green[/green] = share of |Credits|.[/dim]"
     )
 
     console.print(summary_table)
 
     # Display cost breakdown insights
-    if grand_total > 0.01:
+    insight_denom = charges_roll if charges_roll > 0.01 else max(abs(grand_total), 0.01)
+    item_costs: Dict[str, float] = {}
+    for period in cost_data["ResultsByTime"]:
+        for group in period.get("Groups", []):
+            item_name = group["Keys"][0]
+            amount = _metric_amount(group, display_metric)
+            item_costs[item_name] = item_costs.get(item_name, 0.0) + amount
+
+    sorted_pos = sorted(
+        [(k, v) for k, v in item_costs.items() if v > 0.01],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    top_items = sorted_pos[:5]
+
+    if insight_denom > 0.01 and top_items:
         console.print("\n[bold]Cost Breakdown Insights:[/bold]")
-
-        # Aggregate costs by group type
-        item_costs = {}
-        for period in cost_data["ResultsByTime"]:
-            for group in period.get("Groups", []):
-                item_name = group["Keys"][0]
-                amount = _metric_amount(group, display_metric)
-
-                if item_name not in item_costs:
-                    item_costs[item_name] = 0
-                item_costs[item_name] += amount
-
-        # Sort by total cost
-        sorted_items = sorted(item_costs.items(), key=lambda x: x[1], reverse=True)
-        top_items = sorted_items[:5]  # Top 5 cost items
-
-        for item_name, amount in top_items:
-            percentage = (amount / grand_total) * 100
+        u_rt = rt_by_type.get("Usage", 0.0)
+        if abs(u_rt) >= 0.02 and charges_roll > 0.01 and u_rt > charges_roll * 1.2:
             console.print(
-                f"• [cyan]{item_name}[/cyan]: ${amount:.2f} "
-                f"([bold]{percentage:.1f}%[/bold] of total costs)"
+                f"[dim]Percentages below are [bold]of positive SERVICE lines[/bold] (~{_format_net_usd(charges_roll)}), "
+                f"not of RECORD_TYPE Usage ({_format_net_usd(u_rt)}).[/dim]"
             )
 
-            # Provide tips for known services
+        pct_basis = "positive service lines" if charges_roll > 0.01 else "net total"
+        for item_name, amount in top_items:
+            percentage = (amount / insight_denom) * 100
+            console.print(
+                f"• [cyan]{item_name}[/cyan]: ${amount:.2f} "
+                f"([bold]{percentage:.1f}%[/bold] of {pct_basis})"
+            )
+
             tip = get_cost_reduction_tip(item_name)
             if tip:
                 console.print(f"  [yellow]Tip:[/yellow] {tip}")
+
+    if reconcile:
+        print_ce_reconciliation(
+            console, start_date, end_date, service, region, granularity, metric_preference
+        )

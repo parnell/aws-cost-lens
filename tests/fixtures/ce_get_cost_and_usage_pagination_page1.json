@@ -1,0 +1,481 @@
+{
+  "GroupDefinitions": [
+    {
+      "Type": "DIMENSION",
+      "Key": "SERVICE"
+    }
+  ],
+  "DimensionValueAttributes": [],
+  "ResultsByTime": [
+    {
+      "TimePeriod": {
+        "Start": "2026-03-01",
+        "End": "2026-04-01"
+      },
+      "Total": {},
+      "Groups": [
+        {
+          "Keys": [
+            "AWS Amplify"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "-0.0000000028",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "-0.0000000026",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "-0.0000000028",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "-0.0000000028",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "-0.0000000028",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS CloudShell"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0.0000002862",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0.0000002862",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0.0000002862",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0.0000002862",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0.0000002862",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS Config"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS Data Transfer"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "-98.4245565411",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "-98.4245565411",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "-98.4245565411",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "-98.4245565411",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "-98.4245565411",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS Glue"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS Key Management Service"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "-0.000003966",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "-0.000003966",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "-0.000003966",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "-0.000003966",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "-0.000003966",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS Lambda"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS Secrets Manager"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0.0000007726",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0.0000007726",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0.0000007726",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0.0000007726",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0.0000007726",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS Security Hub"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS WAF"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0.0000287184",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0.0000287184",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0.0000287184",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0.0000287184",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0.0000287184",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "AWS X-Ray"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "-0.0000698437",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "Amazon API Gateway"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0.001646283",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0.0017075114",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0.001646283",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0.001646283",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0.001646283",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "Amazon Athena"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "Amazon CloudFront"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0.0000000117",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0.0000000117",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0.0000000117",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0.0000000117",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0.0000000117",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "Amazon Cognito"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "Amazon DynamoDB"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "0",
+              "Unit": "USD"
+            }
+          }
+        },
+        {
+          "Keys": [
+            "Amazon EC2 Container Registry (ECR)"
+          ],
+          "Metrics": {
+            "AmortizedCost": {
+              "Amount": "11.5464671836",
+              "Unit": "USD"
+            },
+            "BlendedCost": {
+              "Amount": "10.9831564654",
+              "Unit": "USD"
+            },
+            "NetAmortizedCost": {
+              "Amount": "11.5464671836",
+              "Unit": "USD"
+            },
+            "NetUnblendedCost": {
+              "Amount": "11.5464671836",
+              "Unit": "USD"
+            },
+            "UnblendedCost": {
+              "Amount": "11.5464671836",
+              "Unit": "USD"
+            }
+          }
+        }
+      ],
+      "Estimated": false
+    }
+  ],
+  "NextPageToken": "fixture-derived-page-2"
+}

@@ -1,28 +1,18 @@
 """Tests for get_cost_data (mocked AWS API)."""
 
+from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from aws_cost_lens.core import CE_METRICS_BUNDLE, get_cost_data
+from tests.fixtures import load_ce_fixture
 
 
 @pytest.fixture
 def mock_ce_response():
-    return {
-        "ResultsByTime": [
-            {
-                "TimePeriod": {"Start": "2026-03-01", "End": "2026-04-01"},
-                "Total": {},
-                "Groups": [
-                    {
-                        "Keys": ["AmazonCloudWatch"],
-                        "Metrics": {"UnblendedCost": {"Amount": "42.50", "Unit": "USD"}},
-                    }
-                ],
-            }
-        ]
-    }
+    """Fixture ``ce_get_cost_and_usage_monthly_by_service`` (live CE capture)."""
+    return deepcopy(load_ce_fixture("ce_get_cost_and_usage_monthly_by_service"))
 
 
 def test_get_cost_data_passes_service_filter_and_returns_response(mock_ce_response):
@@ -89,74 +79,55 @@ def test_get_cost_data_region_and_service_uses_and_filter(mock_ce_response):
     assert len(call_kw["Filter"]["And"]) == 2
 
 
+def test_get_cost_data_ungrouped_omits_group_by(mock_ce_response):
+    mock_client = MagicMock()
+    mock_client.get_cost_and_usage.return_value = mock_ce_response
+
+    with patch("aws_cost_lens.core.boto3.client", return_value=mock_client):
+        get_cost_data("2026-03-01", "2026-04-01", None, None, granularity="MONTHLY")
+
+    call_kw = mock_client.get_cost_and_usage.call_args.kwargs
+    assert "GroupBy" not in call_kw
+    assert call_kw["Metrics"] == CE_METRICS_BUNDLE
+
+
 def test_get_cost_data_paginates_and_merges_groups():
-    page1 = {
-        "ResultsByTime": [
-            {
-                "TimePeriod": {"Start": "2026-03-01", "End": "2026-04-01"},
-                "Groups": [
-                    {
-                        "Keys": ["AmazonS3"],
-                        "Metrics": {"UnblendedCost": {"Amount": "1.00", "Unit": "USD"}},
-                    }
-                ],
-            }
-        ],
-        "NextPageToken": "next",
-    }
-    page2 = {
-        "ResultsByTime": [
-            {
-                "TimePeriod": {"Start": "2026-03-01", "End": "2026-04-01"},
-                "Groups": [
-                    {
-                        "Keys": ["AmazonEC2"],
-                        "Metrics": {"UnblendedCost": {"Amount": "2.00", "Unit": "USD"}},
-                    }
-                ],
-            }
-        ],
-    }
+    page1 = load_ce_fixture("ce_get_cost_and_usage_pagination_page1")
+    page2 = load_ce_fixture("ce_get_cost_and_usage_pagination_page2")
+    expected = len(page1["ResultsByTime"][0]["Groups"]) + len(
+        page2["ResultsByTime"][0]["Groups"]
+    )
     mock_client = MagicMock()
     mock_client.get_cost_and_usage.side_effect = [page1, page2]
 
     with patch("aws_cost_lens.core.boto3.client", return_value=mock_client):
         result = get_cost_data("2026-03-01", "2026-04-01", None, "SERVICE")
 
-    assert len(result["ResultsByTime"][0]["Groups"]) == 2
+    assert len(result["ResultsByTime"][0]["Groups"]) == expected
     assert mock_client.get_cost_and_usage.call_count == 2
     second_call = mock_client.get_cost_and_usage.call_args_list[1].kwargs
-    assert second_call["NextPageToken"] == "next"
+    assert second_call["NextPageToken"] == page1["NextPageToken"]
 
 
 def test_resolve_effective_metric_auto_picks_largest_total():
     from aws_cost_lens.core import resolve_effective_metric
 
-    results = [
-        {
-            "TimePeriod": {"Start": "2026-03-01", "End": "2026-04-01"},
-            "Total": {
-                "UnblendedCost": {"Amount": "0", "Unit": "USD"},
-                "BlendedCost": {"Amount": "100.00", "Unit": "USD"},
-                "NetUnblendedCost": {"Amount": "0", "Unit": "USD"},
-            },
-            "Groups": [],
-        }
-    ]
+    payload = load_ce_fixture("ce_get_cost_and_usage_monthly_by_service")
+    results = payload["ResultsByTime"]
     assert resolve_effective_metric(results, "auto") == "BlendedCost"
 
 
 def test_resolve_effective_metric_forced_unblended():
     from aws_cost_lens.core import resolve_effective_metric
 
-    results = [
-        {
-            "TimePeriod": {"Start": "2026-03-01", "End": "2026-04-01"},
-            "Total": {
-                "UnblendedCost": {"Amount": "0", "Unit": "USD"},
-                "BlendedCost": {"Amount": "100.00", "Unit": "USD"},
-            },
-            "Groups": [],
-        }
-    ]
+    payload = load_ce_fixture("ce_get_cost_and_usage_monthly_by_service")
+    results = payload["ResultsByTime"]
     assert resolve_effective_metric(results, "unblended") == "UnblendedCost"
+
+
+def test_resolve_effective_metric_forced_net_amortized():
+    from aws_cost_lens.core import resolve_effective_metric
+
+    payload = load_ce_fixture("ce_get_cost_and_usage_monthly_by_service")
+    results = payload["ResultsByTime"]
+    assert resolve_effective_metric(results, "net-amortized") == "NetAmortizedCost"

@@ -20,4 +20,12 @@ def test_parse_args_defaults(monkeypatch):
     assert args.service is None
     assert args.detailed is False
     assert args.granularity == "MONTHLY"
-    assert args.metric == "auto"
+    assert args.metric == "unblended"
+    assert args.reconcile is True
+
+
+def test_parse_args_no_reconcile(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["aws-cost-lens", "--no-reconcile"])
+    from aws_cost_lens.cli import parse_args
+
+    assert parse_args().reconcile is False
