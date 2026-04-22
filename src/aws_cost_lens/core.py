@@ -8,13 +8,13 @@ import sys
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, NamedTuple
 
 import boto3
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress
 from rich.table import Table
+from tqdm import tqdm
 from rich.text import Text
 
 # AWS Cost Explorer limits
@@ -70,7 +70,7 @@ def get_account_header_markup() -> str:
     if not account_id:
         return "[yellow]Account: unknown[/yellow]"
 
-    name: Optional[str] = None
+    name: str | None = None
     try:
         org = boto3.client("organizations")
         acc = org.describe_account(AccountId=account_id).get("Account") or {}
@@ -107,7 +107,7 @@ def _merge_cost_and_usage_pages(pages: list[dict]) -> dict:
 def _fetch_cost_and_usage_paginated(ce_client, request_params: dict) -> dict:
     """Call get_cost_and_usage until NextPageToken is exhausted."""
     pages: list[dict] = []
-    next_token: Optional[str] = None
+    next_token: str | None = None
     while True:
         params = dict(request_params)
         if next_token:
@@ -170,10 +170,10 @@ def rollup_record_type_totals(results_by_time: list, metric: str) -> dict[str, f
 
 
 def _build_ce_request_filter(
-    service: Optional[str],
-    region: Optional[str],
-    record_type_values: Optional[List[str]] = None,
-) -> Optional[dict]:
+    service: str | None,
+    region: str | None,
+    record_type_values: list[str] | None = None,
+) -> dict | None:
     """
     Build a ``GetCostAndUsage`` ``Filter`` from optional service, region, and RECORD_TYPE values.
     """
@@ -229,7 +229,7 @@ def _rich_usd_record_type_row(record_type: str, value: float) -> str:
     return f"[red]{s}[/red]"
 
 
-def _split_usage_credit(amount: float) -> Tuple[float, float]:
+def _split_usage_credit(amount: float) -> tuple[float, float]:
     """Split a signed SERVICE line into positive usage vs non-positive credits (CE convention)."""
     if amount > 0.01:
         return amount, 0.0
@@ -238,7 +238,7 @@ def _split_usage_credit(amount: float) -> Tuple[float, float]:
     return 0.0, 0.0
 
 
-def _format_usage_credit_cells(amount: float) -> Tuple[str, str]:
+def _format_usage_credit_cells(amount: float) -> tuple[str, str]:
     """Two display cells: Usage (≥0) and Credits (≤0 or —)."""
     u, c = _split_usage_credit(amount)
     if abs(amount) < 0.005:
@@ -256,7 +256,8 @@ def _service_usage_credit_bar(
     half_chars: int = 20,
 ) -> Text:
     """
-    One bar cell: **red** = usage (what you paid) vs table max usage; **green** = |credit| vs max |credit|.
+    One bar cell: **red** = usage (what you paid) vs table max usage; **green** =
+    |credit| vs max |credit|.
     """
     t = Text()
     wrote = False
@@ -283,9 +284,10 @@ def _monthly_rec_usage_credit_bar(
     """
     RECORD_TYPE summary bar for the monthly table.
 
-    **Red** = net you still pay after credits, ``max(0, Usage + Credits/refunds)`` (same REC columns
-    as the row). **Green** = credits applied, ``max(0, -(Credits/refunds))`` when credits are
-    negative. Segment widths use ``net / (net + |credits|)``, so e.g. ~$34 net and $100 credit →
+    **Red** = net you still pay after credits, ``max(0, Usage + Credits/refunds)`` (same
+    REC columns as the row). **Green** = credits applied, ``max(0, -(Credits/refunds))``
+    when credits are negative. Segment widths use ``net / (net + |credits|)``, so e.g. ~$34 net
+    and $100 credit →
     ~25% red / ~75% green — not gross usage vs |credits| (which would overweight red).
 
     Values below half a cent are treated as zero so rows that print ``$0.00`` do not get a bogus
@@ -304,7 +306,7 @@ def _monthly_rec_usage_credit_bar(
         t.append("—", style="dim")
         return t
 
-    n_red = int(round(W * (paid_shown / denom)))
+    n_red = round(W * (paid_shown / denom))
     n_red = max(0, min(W, n_red))
     n_green = W - n_red
     # If both sides are meaningful, ensure rounding does not erase a sliver entirely.
@@ -424,7 +426,7 @@ class AWSService(Enum):
         return name
 
     @classmethod
-    def get_alias(cls, service_name: str) -> Optional[str]:
+    def get_alias(cls, service_name: str) -> str | None:
         """Get a human-friendly alias for an AWS service name."""
         for service in cls:
             if service.aws_name == service_name and service.aliases:
@@ -442,12 +444,12 @@ def ce_api_json_default(obj: Any) -> Any:
 def get_cost_data(
     start_date: str,
     end_date: str,
-    service: Optional[str],
-    group_by: Optional[Union[str, list[str]]],
+    service: str | None,
+    group_by: str | list[str] | None,
     granularity: str = "MONTHLY",
-    region: Optional[str] = None,
-    record_type_values: Optional[List[str]] = None,
-    ce_api_dump: Optional[list[dict]] = None,
+    region: str | None = None,
+    record_type_values: list[str] | None = None,
+    ce_api_dump: list[dict] | None = None,
     ce_api_label: str = "get_cost_data",
 ) -> dict:
     """
@@ -458,13 +460,13 @@ def get_cost_data(
     """
     console = Console()
 
-    with Progress() as progress:
-        label = f" for {service}" if service else ""
-        if group_by is None:
-            task = progress.add_task(f"[cyan]Fetching AWS account totals{label}...", total=1)
-        else:
-            task = progress.add_task(f"[cyan]Fetching AWS costs{label}...", total=1)
-
+    label = f" for {service}" if service else ""
+    desc = (
+        f"Fetching AWS account totals{label}"
+        if group_by is None
+        else f"Fetching AWS costs{label}"
+    )
+    with tqdm(total=1, desc=desc, unit="", leave=False, dynamic_ncols=True) as pbar:
         try:
             ce_client = boto3.client("ce")
 
@@ -514,7 +516,9 @@ def get_cost_data(
                 if isinstance(group_by, str):
                     request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": group_by}]
                 else:
-                    request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": key} for key in group_by]
+                    request_params["GroupBy"] = [
+                        {"Type": "DIMENSION", "Key": key} for key in group_by
+                    ]
 
             ce_filter = _build_ce_request_filter(service, region, record_type_values)
             if ce_filter is not None:
@@ -522,13 +526,12 @@ def get_cost_data(
 
             response = _fetch_cost_and_usage_paginated(ce_client, request_params)
 
-            progress.update(task, advance=1)
+            pbar.update(1)
             if ce_api_dump is not None:
                 ce_api_dump.append({"label": ce_api_label, "response": response})
             return response
 
         except Exception as e:
-            progress.stop()
             console.print(f"[bold red]Error:[/bold red] {e!s}")
             sys.exit(1)
 
@@ -536,8 +539,8 @@ def get_cost_data(
 def _append_credit_attribution_dumps(
     start_date: str,
     end_date: str,
-    service: Optional[str],
-    region: Optional[str],
+    service: str | None,
+    region: str | None,
     granularity: str,
     display_metric: str,
     credit_row_total: float,
@@ -585,7 +588,8 @@ def _fill_json_out_summary(
     credit_by_service: dict[str, float],
     credit_by_usage_type: dict[str, float],
 ) -> None:
-    """Fill ``--out json`` `summary` block: RECORD_TYPE by period, credit split, vs Billing UI hint."""
+    """Fill ``--out json`` `summary` block: RECORD_TYPE by period, credit split, vs
+    Billing UI hint."""
     per: list[dict] = []
     for period in rt_payload.get("ResultsByTime", []):
         p_rt = rollup_record_type_totals([period], display_metric)
@@ -598,7 +602,7 @@ def _fill_json_out_summary(
             }
         )
 
-    mtd: Optional[dict] = None
+    mtd: dict | None = None
     for row in reversed(per):
         p_rt = row.get("RecordType") or {}
         if any(abs(v) >= 0.005 for v in p_rt.values()):
@@ -611,7 +615,9 @@ def _fill_json_out_summary(
     out["end_date"] = end_date
     out["display_metric"] = display_metric
     out["per_period_record_type"] = per
-    out["record_type_rollup"] = rollup_record_type_totals(rt_payload.get("ResultsByTime", []), display_metric)
+    out["record_type_rollup"] = rollup_record_type_totals(
+        rt_payload.get("ResultsByTime", []), display_metric
+    )
     out["credit_allocations"] = {
         "by_service": credit_by_service,
         "by_usage_type": credit_by_usage_type,
@@ -632,10 +638,11 @@ def _fill_json_out_summary(
         }
     out["cost_management_ui_hint"] = (
         "The Billing home “Cost summary” / “Month-to-date cost” figure is often the same order of "
-        "magnitude as **RECORD_TYPE=Usage** (gross) for the month so far, using the console’s default cost "
-        "type; it may not list **RECORD_TYPE=Credit** on that card. In Cost Explorer, net is reflected "
-        "across line types: Usage + Credit + Refund + Tax (and any other record types in your data). "
-        "For per-invoice or grant names, use Billing → Credits or Cost & Usage Reports, not `GetCostAndUsage`."
+        "magnitude as **RECORD_TYPE=Usage** (gross) for the month so far, using the console’s "
+        "default cost type; it may not list **RECORD_TYPE=Credit** on that card. In Cost "
+        "Explorer, net is reflected across line types: Usage + Credit + Refund + Tax "
+        "(and any other record types in your data). For per-invoice or grant names, use "
+        "Billing → Credits or Cost & Usage Reports, not `GetCostAndUsage`."
     )
     mri = out.get("most_recent_in_range")
     if (
@@ -647,27 +654,32 @@ def _fill_json_out_summary(
         ug = float(mri["record_type_usage"])
         nt = float(mri["implied_net_after_credits_refunds_and_tax"])
         out["one_line_mtd_reconciliation"] = (
-            f"Gross (RECORD_TYPE Usage) ≈ ${ug:.2f}; net (Usage+Credit+Refund+Tax) ≈ ${nt:.2f} for the window. "
-            "The Billing “Month-to-date cost” number is often close to **gross**; credits are easy to miss on that "
-            f"card. Ungrouped Cost Explorer (see `reconcile:ungrouped_total` in `calls`) should match **net** ≈ ${nt:.2f}."
+            f"Gross (RECORD_TYPE Usage) ≈ ${ug:.2f}; net (Usage+Credit+Refund+Tax) ≈ "
+            f"${nt:.2f} for the window. The Billing “Month-to-date cost” number is often close to "
+            f"**gross**; credits are easy to miss on that card. Ungrouped Cost Explorer (see "
+            f"`reconcile:ungrouped_total` in `calls`) should match **net** ≈ ${nt:.2f}."
         )
 
 
 def list_available_services(
     start_date: str,
     end_date: str,
-    region: Optional[str] = None,
+    region: str | None = None,
     metric_preference: str = "auto",
-    ce_api_dump: Optional[list[dict]] = None,
+    ce_api_dump: list[dict] | None = None,
 ) -> None:
     """List all available AWS services that have cost data."""
     console = Console()
     console.print(Panel(get_account_header_markup(), title="AWS account"))
     console.print()
 
-    with Progress() as progress:
-        task = progress.add_task("[cyan]Fetching available AWS services...", total=1)
-
+    with tqdm(
+        total=1,
+        desc="Fetching available AWS services...",
+        unit="",
+        leave=False,
+        dynamic_ncols=True,
+    ) as pbar:
         try:
             ce_client = boto3.client("ce")
 
@@ -687,7 +699,7 @@ def list_available_services(
 
             response = _fetch_cost_and_usage_paginated(ce_client, request_params)
 
-            progress.update(task, advance=1)
+            pbar.update(1)
             if ce_api_dump is not None:
                 ce_api_dump.append({"label": "list_services:by_service", "response": response})
 
@@ -707,7 +719,8 @@ def list_available_services(
 
             if not services:
                 console.print(
-                    "[yellow]No services found with cost data in the specified time range.[/yellow]"
+                    "[yellow]No services found with cost data in the specified time range."
+                    "[/yellow]"
                 )
                 return
 
@@ -723,7 +736,6 @@ def list_available_services(
             console.print(f"\n[dim]Found {len(services)} services.[/dim]")
 
         except Exception as e:
-            progress.stop()
             console.print(f"[bold red]Error:[/bold red] {e!s}")
             sys.exit(1)
 
@@ -765,7 +777,7 @@ def create_cost_table(
     show_all: bool = False,
     granularity: str = "MONTHLY",
     metric: str = DEFAULT_COST_METRIC,
-    record_type_for_period: Optional[Dict[str, float]] = None,
+    record_type_for_period: dict[str, float] | None = None,
 ) -> Table:
     """Create a rich table for a single time period.
 
@@ -867,7 +879,6 @@ def create_cost_table(
     neg_amts = [a for _, a in displayed if a < -0.01]
     max_pos = max(pos_amts, default=0.0)
     max_neg = max((abs(a) for a in neg_amts), default=0.0)
-    max_abs_all = max((abs(c) for _, c in displayed), default=0.0)
 
     # Add rows
     for name, amount in costs:
@@ -886,8 +897,8 @@ def create_cost_table(
         table.caption = f"Showing all items including {zero_count} with $0.00 cost"
 
     cap_bits = [
-        "Bar: [red]red[/red] = usage (paid) vs largest usage in table; [green]green[/green] = |credits| vs "
-        "largest |credit| line (separate scales side by side)."
+        "Bar: [red]red[/red] = usage (paid) vs largest usage in table; "
+        "[green]green[/green] = |credits| vs largest |credit| line (separate scales side by side)."
     ]
     if group_by == "SERVICE" and record_type_for_period:
         u = record_type_for_period.get("Usage")
@@ -966,16 +977,16 @@ def should_show_in_progress(period_date: str, granularity: str = "MONTHLY") -> b
 def analyze_costs_detailed(
     start_date: str,
     end_date: str,
-    service: Optional[str],
+    service: str | None,
     top: int,
     show_region: bool = False,
     show_all: bool = False,
     granularity: str = "MONTHLY",
-    region: Optional[str] = None,
+    region: str | None = None,
     metric_preference: str = "auto",
     reconcile: bool = True,
-    ce_api_dump: Optional[list[dict]] = None,
-    out_summary: Optional[dict] = None,
+    ce_api_dump: list[dict] | None = None,
+    out_summary: dict | None = None,
 ) -> None:
     """Analyze costs with detailed breakdown by SERVICE, USAGE_TYPE, and optionally REGION."""
     console = Console()
@@ -1060,9 +1071,14 @@ def analyze_costs_detailed(
             float(rt_by_type.get("Credit", 0.0)),
             ce_api_dump,
         )
-        if out_summary is not None and (cr_svc or cr_uty or abs(float(rt_by_type.get("Credit", 0.0))) >= 0.005):
+        if out_summary is not None and (
+            cr_svc
+            or cr_uty
+            or abs(float(rt_by_type.get("Credit", 0.0))) >= 0.005
+        ):
             console.print(
-                "[dim]JSON dump: added credit:by_service and credit:by_usage_type (RECORD_TYPE=Credit).[/dim]"
+                "[dim]JSON dump: added credit:by_service and credit:by_usage_type "
+                "(RECORD_TYPE=Credit).[/dim]"
             )
 
     net_roll, charges_roll, credits_roll = rollup_net_charges_credits(
@@ -1149,7 +1165,8 @@ def analyze_costs_detailed(
             table.add_row(service_name, usage_type, usage_s, cred_s, bar_cell)
 
         table.caption = (
-            "Same bar style as SERVICE: [red]red[/red]=paid vs max, [green]green[/green]=credits vs max |credit|."
+            "Same bar style as SERVICE: [red]red[/red]=paid vs max, "
+            "[green]green[/green]=credits vs max |credit|."
         )
 
         console.print(table)
@@ -1269,7 +1286,7 @@ def analyze_costs_detailed(
         )
 
 
-def get_cost_reduction_tip(service_name: str) -> Optional[str]:
+def get_cost_reduction_tip(service_name: str) -> str | None:
     """Get cost reduction tip for specific services."""
     tips = {
         AWSService.CLOUDWATCH.aws_name: (
@@ -1290,7 +1307,9 @@ def get_cost_reduction_tip(service_name: str) -> Optional[str]:
         AWSService.DYNAMODB.aws_name: (
             "Review provisioned capacity, use on-demand when appropriate"
         ),
-        AWSService.ECR.aws_name: ("Clean up unused container images and review lifecycle policies"),
+        AWSService.ECR.aws_name: (
+            "Clean up unused container images and review lifecycle policies"
+        ),
         AWSService.ROUTE53.aws_name: "Review hosted zones and resource record sets",
         AWSService.SNS.aws_name: (
             "Review notification volume and optimize topic/subscription patterns"
@@ -1315,7 +1334,7 @@ def get_cost_reduction_tip(service_name: str) -> Optional[str]:
     return None
 
 
-_RECON_METRIC_COLUMNS: List[Tuple[str, str]] = [
+_RECON_METRIC_COLUMNS: list[tuple[str, str]] = [
     ("Unblended", "UnblendedCost"),
     ("Blended", "BlendedCost"),
     ("NetUnbl", "NetUnblendedCost"),
@@ -1328,11 +1347,11 @@ def print_ce_reconciliation(
     console: Console,
     start_date: str,
     end_date: str,
-    service: Optional[str],
-    region: Optional[str],
+    service: str | None,
+    region: str | None,
     granularity: str,
     metric_preference: str,
-    ce_api_dump: Optional[list[dict]] = None,
+    ce_api_dump: list[dict] | None = None,
 ) -> None:
     """
     Show official CE ``Total`` lines (no GROUP BY) and a ``RECORD_TYPE`` breakdown.
@@ -1344,7 +1363,8 @@ def print_ce_reconciliation(
     console.print("\n[bold]Reconciliation — Cost Explorer API only[/bold]")
     console.print(
         "[dim]There is no separate boto3 “billing dashboard” total. These rows are still "
-        "``ce:GetCostAndUsage``. Enable Cost & Usage Reports to S3 for invoice/CUR-aligned data.[/dim]"
+        "``ce:GetCostAndUsage``. Enable Cost & Usage Reports to S3 for invoice/CUR-aligned "
+        "data.[/dim]"
     )
 
     totals_payload = get_cost_data(
@@ -1425,15 +1445,15 @@ def print_ce_reconciliation(
 def analyze_costs_simple(
     start_date: str,
     end_date: str,
-    service: Optional[str],
+    service: str | None,
     top: int = 0,
     show_all: bool = False,
     granularity: str = "MONTHLY",
-    region: Optional[str] = None,
+    region: str | None = None,
     metric_preference: str = "auto",
     reconcile: bool = True,
-    ce_api_dump: Optional[list[dict]] = None,
-    out_summary: Optional[dict] = None,
+    ce_api_dump: list[dict] | None = None,
+    out_summary: dict | None = None,
 ) -> None:
     """Simple cost analysis view."""
     console = Console()
@@ -1481,7 +1501,9 @@ def analyze_costs_simple(
     if not has_data:
         if out_summary is not None:
             out_summary["status"] = "no_cost_data"
-        console.print("[bold yellow]No cost data found for the specified parameters.[/bold yellow]")
+        console.print(
+            "[bold yellow]No cost data found for the specified parameters.[/bold yellow]"
+        )
         return
 
     display_metric = resolve_effective_metric(cost_data["ResultsByTime"], metric_preference)
@@ -1517,9 +1539,14 @@ def analyze_costs_simple(
             float(rt_by_type.get("Credit", 0.0)),
             ce_api_dump,
         )
-        if out_summary is not None and (cr_svc or cr_uty or abs(float(rt_by_type.get("Credit", 0.0))) >= 0.005):
+        if out_summary is not None and (
+            cr_svc
+            or cr_uty
+            or abs(float(rt_by_type.get("Credit", 0.0))) >= 0.005
+        ):
             console.print(
-                "[dim]JSON dump: added credit:by_service and credit:by_usage_type (RECORD_TYPE=Credit).[/dim]"
+                "[dim]JSON dump: added credit:by_service and credit:by_usage_type "
+                "(RECORD_TYPE=Credit).[/dim]"
             )
 
     net_roll, charges_roll, credits_roll = rollup_net_charges_credits(
@@ -1619,7 +1646,7 @@ def analyze_costs_simple(
 
     # Display cost breakdown insights
     insight_denom = charges_roll if charges_roll > 0.01 else max(abs(grand_total), 0.01)
-    item_costs: Dict[str, float] = {}
+    item_costs: dict[str, float] = {}
     for period in cost_data["ResultsByTime"]:
         for group in period.get("Groups", []):
             item_name = group["Keys"][0]
@@ -1638,8 +1665,9 @@ def analyze_costs_simple(
         u_rt = rt_by_type.get("Usage", 0.0)
         if abs(u_rt) >= 0.02 and charges_roll > 0.01 and u_rt > charges_roll * 1.2:
             console.print(
-                f"[dim]Percentages below are [bold]of positive SERVICE lines[/bold] (~{_format_net_usd(charges_roll)}), "
-                f"not of RECORD_TYPE Usage ({_format_net_usd(u_rt)}).[/dim]"
+                f"[dim]Percentages below are [bold]of positive SERVICE lines[/bold] "
+                f"(~{_format_net_usd(charges_roll)}), not of RECORD_TYPE Usage "
+                f"({_format_net_usd(u_rt)}).[/dim]"
             )
 
         pct_basis = "positive service lines" if charges_roll > 0.01 else "net total"
