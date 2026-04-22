@@ -6,8 +6,9 @@ Core functionality for displaying AWS costs by service and usage type with rich 
 
 import sys
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import boto3
 from rich.console import Console
@@ -168,11 +169,64 @@ def rollup_record_type_totals(results_by_time: list, metric: str) -> dict[str, f
     return out
 
 
+def _build_ce_request_filter(
+    service: Optional[str],
+    region: Optional[str],
+    record_type_values: Optional[List[str]] = None,
+) -> Optional[dict]:
+    """
+    Build a ``GetCostAndUsage`` ``Filter`` from optional service, region, and RECORD_TYPE values.
+    """
+    parts: list[dict] = []
+    if record_type_values:
+        parts.append({"Dimensions": {"Key": "RECORD_TYPE", "Values": list(record_type_values)}})
+    if service:
+        normalized = AWSService.get_service(service)
+        parts.append({"Dimensions": {"Key": "SERVICE", "Values": [normalized]}})
+    if region:
+        parts.append({"Dimensions": {"Key": "REGION", "Values": [region]}})
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return {"And": parts}
+
+
 def _format_net_usd(value: float) -> str:
     """Format a net dollar amount; near-zero floats print as $0.00."""
     if abs(value) < 0.005:
         return "$0.00"
     return f"${value:.2f}"
+
+
+def _rich_usd_positive_red_negative_green(value: float) -> str:
+    """Rich markup: charges / net spend positive → red; credits / net negative → green."""
+    s = _format_net_usd(value)
+    if abs(value) < 0.005:
+        return f"[dim]{s}[/dim]"
+    if value > 0:
+        return f"[red]{s}[/red]"
+    return f"[green]{s}[/green]"
+
+
+def _rich_usd_signed_bold(value: float) -> str:
+    """Bold Total / grand-total style with the same red / green sign convention."""
+    s = _format_net_usd(value)
+    if abs(value) < 0.005:
+        return f"[bold dim]{s}[/bold dim]"
+    if value > 0:
+        return f"[bold red]{s}[/bold red]"
+    return f"[bold green]{s}[/bold green]"
+
+
+def _rich_usd_record_type_row(record_type: str, value: float) -> str:
+    """RECORD_TYPE line item: cost-like rows red; Credit / Refund rows green."""
+    s = _format_net_usd(value)
+    if abs(value) < 0.005:
+        return f"[dim]{s}[/dim]"
+    if record_type in ("Credit", "Refund"):
+        return f"[green]{s}[/green]"
+    return f"[red]{s}[/red]"
 
 
 def _split_usage_credit(amount: float) -> Tuple[float, float]:
@@ -227,29 +281,44 @@ def _monthly_rec_usage_credit_bar(
     console_width: int,
 ) -> Text:
     """
-    RECORD_TYPE summary bar: **red** = Usage (paid); **green** = |Credits| (credits applied).
-    Width of each segment is proportional to its share of (Usage + |Credits|).
+    RECORD_TYPE summary bar for the monthly table.
+
+    **Red** = net you still pay after credits, ``max(0, Usage + Credits/refunds)`` (same REC columns
+    as the row). **Green** = credits applied, ``max(0, -(Credits/refunds))`` when credits are
+    negative. Segment widths use ``net / (net + |credits|)``, so e.g. ~$34 net and $100 credit →
+    ~25% red / ~75% green — not gross usage vs |credits| (which would overweight red).
+
+    Values below half a cent are treated as zero so rows that print ``$0.00`` do not get a bogus
+    bar from float noise.
     """
-    u = max(0.0, usage_rec)
-    c_abs = abs(min(0.0, credits_rec))
+    near = 0.005
+    u = 0.0 if abs(float(usage_rec)) < near else float(usage_rec)
+    c = 0.0 if abs(float(credits_rec)) < near else float(credits_rec)
+    credit_mag = max(0.0, -c)  # CE credits are negative
+    paid_shown = max(0.0, u + c)
+
     t = Text()
     W = max(12, min(40, int(console_width / 3)))
-    if u < 1e-9 and c_abs < 1e-9:
+    denom = paid_shown + credit_mag
+    if denom < near:
         t.append("—", style="dim")
         return t
-    tot = u + c_abs
-    if tot < 1e-12:
-        t.append("—", style="dim")
-        return t
-    n_paid = max(1, round(W * (u / tot)))
-    n_cred = W - n_paid
-    if n_cred < 1:
-        n_cred = 1
-        n_paid = W - 1
-    t.append("█" * n_paid, style="red")
-    t.append("█" * n_cred, style="green")
+
+    n_red = int(round(W * (paid_shown / denom)))
+    n_red = max(0, min(W, n_red))
+    n_green = W - n_red
+    # If both sides are meaningful, ensure rounding does not erase a sliver entirely.
+    if paid_shown >= near and credit_mag >= near:
+        if n_red == 0:
+            n_red = 1
+            n_green = W - 1
+        elif n_green == 0:
+            n_green = 1
+            n_red = W - 1
+    t.append("█" * n_red, style="red")
+    t.append("█" * n_green, style="green")
     t.append(
-        f"  {100 * u / tot:.0f}% paid · {100 * c_abs / tot:.0f}% credits",
+        f"  {100 * paid_shown / denom:.0f}% paid · {100 * credit_mag / denom:.0f}% credits",
         style="dim",
     )
     return t
@@ -363,6 +432,13 @@ class AWSService(Enum):
         return None
 
 
+def ce_api_json_default(obj: Any) -> Any:
+    """Default for :func:`json.dumps` when serializing Cost Explorer (boto3) payloads."""
+    if isinstance(obj, Decimal):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__!s} is not JSON serializable")
+
+
 def get_cost_data(
     start_date: str,
     end_date: str,
@@ -370,6 +446,9 @@ def get_cost_data(
     group_by: Optional[Union[str, list[str]]],
     granularity: str = "MONTHLY",
     region: Optional[str] = None,
+    record_type_values: Optional[List[str]] = None,
+    ce_api_dump: Optional[list[dict]] = None,
+    ce_api_label: str = "get_cost_data",
 ) -> dict:
     """
     Fetch cost data from AWS Cost Explorer API.
@@ -437,34 +516,15 @@ def get_cost_data(
                 else:
                     request_params["GroupBy"] = [{"Type": "DIMENSION", "Key": key} for key in group_by]
 
-            # Add service filter if specified
-            if service or region:
-                filter_dict = {"Dimensions": {}}
-
-                if service:
-                    # Normalize the service name
-                    normalized_service = AWSService.get_service(service)
-                    filter_dict["Dimensions"]["Key"] = "SERVICE"
-                    filter_dict["Dimensions"]["Values"] = [normalized_service]
-
-                if region:
-                    # If both service and region are specified, use 'And' operator
-                    if service:
-                        filter_dict = {
-                            "And": [
-                                {"Dimensions": {"Key": "SERVICE", "Values": [normalized_service]}},
-                                {"Dimensions": {"Key": "REGION", "Values": [region]}},
-                            ]
-                        }
-                    else:
-                        filter_dict["Dimensions"]["Key"] = "REGION"
-                        filter_dict["Dimensions"]["Values"] = [region]
-
-                request_params["Filter"] = filter_dict
+            ce_filter = _build_ce_request_filter(service, region, record_type_values)
+            if ce_filter is not None:
+                request_params["Filter"] = ce_filter
 
             response = _fetch_cost_and_usage_paginated(ce_client, request_params)
 
             progress.update(task, advance=1)
+            if ce_api_dump is not None:
+                ce_api_dump.append({"label": ce_api_label, "response": response})
             return response
 
         except Exception as e:
@@ -473,11 +533,132 @@ def get_cost_data(
             sys.exit(1)
 
 
+def _append_credit_attribution_dumps(
+    start_date: str,
+    end_date: str,
+    service: Optional[str],
+    region: Optional[str],
+    granularity: str,
+    display_metric: str,
+    credit_row_total: float,
+    ce_api_dump: list[dict],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    Extra CE calls: ``RECORD_TYPE=Credit`` with ``GroupBy`` SERVICE and USAGE_TYPE. Returns rollups
+    for ``display_metric``; skips when total Credit is negligible.
+    """
+    if abs(credit_row_total) < 0.005:
+        return {}, {}
+    svc = get_cost_data(
+        start_date,
+        end_date,
+        service,
+        "SERVICE",
+        granularity,
+        region,
+        record_type_values=["Credit"],
+        ce_api_dump=ce_api_dump,
+        ce_api_label="credit:by_service",
+    )
+    uty = get_cost_data(
+        start_date,
+        end_date,
+        service,
+        "USAGE_TYPE",
+        granularity,
+        region,
+        record_type_values=["Credit"],
+        ce_api_dump=ce_api_dump,
+        ce_api_label="credit:by_usage_type",
+    )
+    s_tot = rollup_record_type_totals(svc.get("ResultsByTime", []), display_metric)
+    u_tot = rollup_record_type_totals(uty.get("ResultsByTime", []), display_metric)
+    return s_tot, u_tot
+
+
+def _fill_json_out_summary(
+    out: dict,
+    start_date: str,
+    end_date: str,
+    display_metric: str,
+    rt_payload: dict,
+    credit_by_service: dict[str, float],
+    credit_by_usage_type: dict[str, float],
+) -> None:
+    """Fill ``--out json`` `summary` block: RECORD_TYPE by period, credit split, vs Billing UI hint."""
+    per: list[dict] = []
+    for period in rt_payload.get("ResultsByTime", []):
+        p_rt = rollup_record_type_totals([period], display_metric)
+        per.append(
+            {
+                "TimePeriod": period.get("TimePeriod"),
+                "Estimated": period.get("Estimated"),
+                "RecordType": p_rt,
+                "net_from_record_type_rows": float(sum(p_rt.values())),
+            }
+        )
+
+    mtd: Optional[dict] = None
+    for row in reversed(per):
+        p_rt = row.get("RecordType") or {}
+        if any(abs(v) >= 0.005 for v in p_rt.values()):
+            mtd = row
+            break
+    if mtd is None and per:
+        mtd = per[-1]
+
+    out["start_date"] = start_date
+    out["end_date"] = end_date
+    out["display_metric"] = display_metric
+    out["per_period_record_type"] = per
+    out["record_type_rollup"] = rollup_record_type_totals(rt_payload.get("ResultsByTime", []), display_metric)
+    out["credit_allocations"] = {
+        "by_service": credit_by_service,
+        "by_usage_type": credit_by_usage_type,
+    }
+
+    if mtd and isinstance(mtd.get("RecordType"), dict):
+        mrt: dict = mtd["RecordType"]
+        u = float(mrt.get("Usage", 0.0))
+        c = float(mrt.get("Credit", 0.0)) + float(mrt.get("Refund", 0.0))
+        tax = float(mrt.get("Tax", 0.0))
+        out["most_recent_in_range"] = {
+            "TimePeriod": mtd.get("TimePeriod"),
+            "Estimated": mtd.get("Estimated"),
+            "record_type_usage": u,
+            "record_type_credits_and_refunds": c,
+            "record_type_tax": tax,
+            "implied_net_after_credits_refunds_and_tax": u + c + tax,
+        }
+    out["cost_management_ui_hint"] = (
+        "The Billing home “Cost summary” / “Month-to-date cost” figure is often the same order of "
+        "magnitude as **RECORD_TYPE=Usage** (gross) for the month so far, using the console’s default cost "
+        "type; it may not list **RECORD_TYPE=Credit** on that card. In Cost Explorer, net is reflected "
+        "across line types: Usage + Credit + Refund + Tax (and any other record types in your data). "
+        "For per-invoice or grant names, use Billing → Credits or Cost & Usage Reports, not `GetCostAndUsage`."
+    )
+    mri = out.get("most_recent_in_range")
+    if (
+        mri
+        and isinstance(mri, dict)
+        and "record_type_usage" in mri
+        and "implied_net_after_credits_refunds_and_tax" in mri
+    ):
+        ug = float(mri["record_type_usage"])
+        nt = float(mri["implied_net_after_credits_refunds_and_tax"])
+        out["one_line_mtd_reconciliation"] = (
+            f"Gross (RECORD_TYPE Usage) ≈ ${ug:.2f}; net (Usage+Credit+Refund+Tax) ≈ ${nt:.2f} for the window. "
+            "The Billing “Month-to-date cost” number is often close to **gross**; credits are easy to miss on that "
+            f"card. Ungrouped Cost Explorer (see `reconcile:ungrouped_total` in `calls`) should match **net** ≈ ${nt:.2f}."
+        )
+
+
 def list_available_services(
     start_date: str,
     end_date: str,
     region: Optional[str] = None,
     metric_preference: str = "auto",
+    ce_api_dump: Optional[list[dict]] = None,
 ) -> None:
     """List all available AWS services that have cost data."""
     console = Console()
@@ -507,6 +688,8 @@ def list_available_services(
             response = _fetch_cost_and_usage_paginated(ce_client, request_params)
 
             progress.update(task, advance=1)
+            if ce_api_dump is not None:
+                ce_api_dump.append({"label": "list_services:by_service", "response": response})
 
             chosen = resolve_effective_metric(response.get("ResultsByTime", []), metric_preference)
 
@@ -711,8 +894,9 @@ def create_cost_table(
         cr = record_type_for_period.get("Credit", 0.0) + record_type_for_period.get("Refund", 0.0)
         if u is not None and abs(u) >= 0.005:
             cap_bits.append(
-                f"RECORD_TYPE for this period: Usage {_format_net_usd(u)} • "
-                f"Credits/refunds {_format_net_usd(cr)} (SERVICE rows allocate credits unevenly)."
+                "RECORD_TYPE for this period: Usage "
+                f"[red]{_format_net_usd(u)}[/red] • Credits/refunds "
+                f"[green]{_format_net_usd(cr)}[/green] (SERVICE rows allocate credits unevenly)."
             )
     if table.caption:
         table.caption += "\n" + " ".join(cap_bits)
@@ -790,6 +974,8 @@ def analyze_costs_detailed(
     region: Optional[str] = None,
     metric_preference: str = "auto",
     reconcile: bool = True,
+    ce_api_dump: Optional[list[dict]] = None,
+    out_summary: Optional[dict] = None,
 ) -> None:
     """Analyze costs with detailed breakdown by SERVICE, USAGE_TYPE, and optionally REGION."""
     console = Console()
@@ -825,6 +1011,8 @@ def analyze_costs_detailed(
         ["SERVICE", "USAGE_TYPE"],
         granularity,
         region,
+        ce_api_dump=ce_api_dump,
+        ce_api_label="detailed:service+usage_type",
     )
 
     # Check if we got any data
@@ -835,6 +1023,8 @@ def analyze_costs_detailed(
             break
 
     if not has_data:
+        if out_summary is not None:
+            out_summary["status"] = "no_cost_data"
         console.print("[yellow]No data found for the specified parameters.[/yellow]")
         return
 
@@ -845,20 +1035,49 @@ def analyze_costs_detailed(
             f"(auto picks the largest |total| across bundled CE metrics)[/dim]"
         )
 
-    rt_payload = get_cost_data(start_date, end_date, service, "RECORD_TYPE", granularity, region)
+    rt_payload = get_cost_data(
+        start_date,
+        end_date,
+        service,
+        "RECORD_TYPE",
+        granularity,
+        region,
+        ce_api_dump=ce_api_dump,
+        ce_api_label="detailed:record_type",
+    )
     rt_by_type = rollup_record_type_totals(rt_payload["ResultsByTime"], display_metric)
+
+    cr_svc: dict[str, float] = {}
+    cr_uty: dict[str, float] = {}
+    if ce_api_dump is not None:
+        cr_svc, cr_uty = _append_credit_attribution_dumps(
+            start_date,
+            end_date,
+            service,
+            region,
+            granularity,
+            display_metric,
+            float(rt_by_type.get("Credit", 0.0)),
+            ce_api_dump,
+        )
+        if out_summary is not None and (cr_svc or cr_uty or abs(float(rt_by_type.get("Credit", 0.0))) >= 0.005):
+            console.print(
+                "[dim]JSON dump: added credit:by_service and credit:by_usage_type (RECORD_TYPE=Credit).[/dim]"
+            )
 
     net_roll, charges_roll, credits_roll = rollup_net_charges_credits(
         cost_data["ResultsByTime"], display_metric
     )
     console.print(
-        f"[dim]Rollup (by SERVICE rows): net {_format_net_usd(net_roll)} • gross charges "
-        f"{_format_net_usd(charges_roll)} • credits/refunds {_format_net_usd(credits_roll)}[/dim]"
+        "[dim]Rollup (by SERVICE rows):[/dim] "
+        f"net {_rich_usd_positive_red_negative_green(net_roll)} "
+        f"[dim]• gross charges[/dim] [red]{_format_net_usd(charges_roll)}[/red] "
+        f"[dim]• credits/refunds[/dim] [green]{_format_net_usd(credits_roll)}[/green]"
     )
     rt_parts = []
     for key in ("Usage", "Credit", "Refund", "Tax", "Distributor Discount"):
         if key in rt_by_type and abs(rt_by_type[key]) >= 0.005:
-            rt_parts.append(f"{key} {_format_net_usd(rt_by_type[key])}")
+            rt_parts.append(f"{key} {_rich_usd_record_type_row(key, rt_by_type[key])}")
     if rt_parts:
         console.print(
             "[dim]RECORD_TYPE (Billing home / CE “Usage vs credits” style): "
@@ -899,7 +1118,7 @@ def analyze_costs_detailed(
 
         table = Table(title=title, expand=True)
         table.add_column("Service", style="cyan")
-        table.add_column("Usage Type", style="green")
+        table.add_column("Usage Type", style="dim")
         table.add_column("Usage", justify="right", style="red")
         table.add_column("Credits", justify="right", style="green")
         table.add_column("Bar (red=paid · green=credits)", ratio=1)
@@ -938,7 +1157,16 @@ def analyze_costs_detailed(
     # If region breakdown is requested, add that too
     if show_region:
         console.print("\n[bold]Analyzing by REGION[/bold]")
-        region_data = get_cost_data(start_date, end_date, service, "REGION", granularity, region)
+        region_data = get_cost_data(
+            start_date,
+            end_date,
+            service,
+            "REGION",
+            granularity,
+            region,
+            ce_api_dump=ce_api_dump,
+            ce_api_label="detailed:region",
+        )
 
         # Display costs for each month
         for period in region_data["ResultsByTime"]:
@@ -952,7 +1180,16 @@ def analyze_costs_detailed(
     console.print("\n[bold]Cost Summary by Month[/bold]")
 
     # Get service-level data for summary
-    service_data = get_cost_data(start_date, end_date, service, "SERVICE", granularity, region)
+    service_data = get_cost_data(
+        start_date,
+        end_date,
+        service,
+        "SERVICE",
+        granularity,
+        region,
+        ce_api_dump=ce_api_dump,
+        ce_api_label="detailed:service_summary",
+    )
     rt_periods_d = rt_payload.get("ResultsByTime", [])
     monthly_totals = []
     grand_total = 0.0
@@ -982,7 +1219,7 @@ def analyze_costs_detailed(
     # Display summary table
     summary_table = Table(title="Monthly Summary", expand=True)
     summary_table.add_column("Month", style="cyan")
-    summary_table.add_column("Net", justify="right", style="green")
+    summary_table.add_column("Net", justify="right")
     summary_table.add_column("Usage (REC)", justify="right", style="red")
     summary_table.add_column("Credits (REC)", justify="right", style="green")
     summary_table.add_column("Bar (red=paid · green=credits)", ratio=1)
@@ -992,31 +1229,43 @@ def analyze_costs_detailed(
         bar = _monthly_rec_usage_credit_bar(usage_rt, cred_rt, console.width)
         summary_table.add_row(
             label,
-            _format_net_usd(total),
+            _rich_usd_positive_red_negative_green(total),
             _format_net_usd(usage_rt),
             _format_net_usd(cred_rt),
             bar,
         )
 
     summary_table.add_row(
-        "GRAND TOTAL",
-        _format_net_usd(grand_total),
-        _format_net_usd(grand_usage_rt),
-        _format_net_usd(grand_cred_rt),
+        "[bold]GRAND TOTAL[/bold]",
+        _rich_usd_signed_bold(grand_total),
+        f"[bold red]{_format_net_usd(grand_usage_rt)}[/bold red]",
+        f"[bold green]{_format_net_usd(grand_cred_rt)}[/bold green]",
         _monthly_rec_usage_credit_bar(grand_usage_rt, grand_cred_rt, console.width),
-        style="bold",
     )
 
     summary_table.caption = (
         "[dim]Net = SERVICE lines; Usage (REC) / Credits (REC) = RECORD_TYPE (Billing MTD). "
-        "Bar: [red]red[/red] = share of Usage (paid), [green]green[/green] = share of |Credits|.[/dim]"
+        "Bar: [red]red[/red] = net after credits vs (net+|credits|); "
+        "[green]green[/green] = |credits| share.[/dim]"
     )
 
     console.print(summary_table)
 
     if reconcile:
         print_ce_reconciliation(
-            console, start_date, end_date, service, region, granularity, metric_preference
+            console,
+            start_date,
+            end_date,
+            service,
+            region,
+            granularity,
+            metric_preference,
+            ce_api_dump=ce_api_dump,
+        )
+
+    if out_summary is not None:
+        _fill_json_out_summary(
+            out_summary, start_date, end_date, display_metric, rt_payload, cr_svc, cr_uty
         )
 
 
@@ -1083,6 +1332,7 @@ def print_ce_reconciliation(
     region: Optional[str],
     granularity: str,
     metric_preference: str,
+    ce_api_dump: Optional[list[dict]] = None,
 ) -> None:
     """
     Show official CE ``Total`` lines (no GROUP BY) and a ``RECORD_TYPE`` breakdown.
@@ -1097,20 +1347,52 @@ def print_ce_reconciliation(
         "``ce:GetCostAndUsage``. Enable Cost & Usage Reports to S3 for invoice/CUR-aligned data.[/dim]"
     )
 
-    totals_payload = get_cost_data(start_date, end_date, service, None, granularity, region)
+    totals_payload = get_cost_data(
+        start_date,
+        end_date,
+        service,
+        None,
+        granularity,
+        region,
+        ce_api_dump=ce_api_dump,
+        ce_api_label="reconcile:ungrouped_total",
+    )
     periods = totals_payload.get("ResultsByTime") or []
     if not periods:
         console.print("[yellow]No ungrouped Cost Explorer data for this range.[/yellow]")
         return
 
+    rt_payload = get_cost_data(
+        start_date,
+        end_date,
+        service,
+        "RECORD_TYPE",
+        granularity,
+        region,
+        ce_api_dump=ce_api_dump,
+        ce_api_label="reconcile:record_type",
+    )
+    dm_rt = resolve_effective_metric(rt_payload["ResultsByTime"], metric_preference)
+
+    cred_by_period_start: dict[str, float] = {}
+    for period in rt_payload.get("ResultsByTime", []):
+        ts = period["TimePeriod"]["Start"]
+        p_rt = rollup_record_type_totals([period], dm_rt)
+        cred_by_period_start[ts] = float(p_rt.get("Credit", 0.0)) + float(p_rt.get("Refund", 0.0))
+
     t_api = Table(title="Ungrouped CE Total (API Total block per period)", expand=True)
     t_api.add_column("Period", style="cyan", no_wrap=True)
+    t_api.add_column("Credit (REC)", justify="right")
     for short, _full in _RECON_METRIC_COLUMNS:
         t_api.add_column(short, justify="right")
 
     for period in periods:
         ts = period["TimePeriod"]["Start"]
-        row: list[str] = [format_date_period(ts, granularity)]
+        cred = cred_by_period_start.get(ts, 0.0)
+        row: list[str] = [
+            format_date_period(ts, granularity),
+            _rich_usd_positive_red_negative_green(cred),
+        ]
         tot = period.get("Total") or {}
         for _short, full in _RECON_METRIC_COLUMNS:
             block = tot.get(full) or {}
@@ -1118,14 +1400,10 @@ def print_ce_reconciliation(
             if amt in (None, ""):
                 row.append("—")
             else:
-                row.append(_format_net_usd(float(amt)))
+                row.append(_rich_usd_positive_red_negative_green(float(amt)))
         t_api.add_row(*row)
 
     console.print(t_api)
-
-    rt_payload = get_cost_data(start_date, end_date, service, "RECORD_TYPE", granularity, region)
-    dm_rt = resolve_effective_metric(rt_payload["ResultsByTime"], metric_preference)
-    console.print(f"[dim]RECORD_TYPE breakdown uses metric: {dm_rt}[/dim]")
 
     agg: dict[str, float] = {}
     for period in rt_payload.get("ResultsByTime", []):
@@ -1133,11 +1411,14 @@ def print_ce_reconciliation(
             key = (g.get("Keys") or ["?"])[0]
             agg[key] = agg.get(key, 0.0) + _metric_amount_raw(g, dm_rt)
 
+    console.print(f"[dim]RECORD_TYPE breakdown uses metric: {dm_rt}[/dim]")
     rt_table = Table(title="By RECORD_TYPE (aggregated)", expand=True)
     rt_table.add_column("RECORD_TYPE", style="cyan")
-    rt_table.add_column("Amount", justify="right", style="green")
+    rt_table.add_column("Amount", justify="right")
     for k in sorted(agg.keys(), key=lambda x: abs(agg[x]), reverse=True):
-        rt_table.add_row(k, _format_net_usd(agg[k]))
+        rt_table.add_row(k, _rich_usd_record_type_row(k, agg[k]))
+    total_rt = float(sum(agg.values()))
+    rt_table.add_row("[bold]Total[/bold]", _rich_usd_signed_bold(total_rt))
     console.print(rt_table)
 
 
@@ -1151,6 +1432,8 @@ def analyze_costs_simple(
     region: Optional[str] = None,
     metric_preference: str = "auto",
     reconcile: bool = True,
+    ce_api_dump: Optional[list[dict]] = None,
+    out_summary: Optional[dict] = None,
 ) -> None:
     """Simple cost analysis view."""
     console = Console()
@@ -1177,7 +1460,16 @@ def analyze_costs_simple(
     )
 
     # Get cost data from AWS Cost Explorer using SERVICE grouping for simple view
-    cost_data = get_cost_data(start_date, end_date, service, "SERVICE", granularity, region)
+    cost_data = get_cost_data(
+        start_date,
+        end_date,
+        service,
+        "SERVICE",
+        granularity,
+        region,
+        ce_api_dump=ce_api_dump,
+        ce_api_label="simple:service",
+    )
 
     # Check if we got any data
     has_data = False
@@ -1187,6 +1479,8 @@ def analyze_costs_simple(
             break
 
     if not has_data:
+        if out_summary is not None:
+            out_summary["status"] = "no_cost_data"
         console.print("[bold yellow]No cost data found for the specified parameters.[/bold yellow]")
         return
 
@@ -1197,21 +1491,50 @@ def analyze_costs_simple(
             f"(auto picks the largest |total| across bundled CE metrics)[/dim]"
         )
 
-    rt_payload = get_cost_data(start_date, end_date, service, "RECORD_TYPE", granularity, region)
+    rt_payload = get_cost_data(
+        start_date,
+        end_date,
+        service,
+        "RECORD_TYPE",
+        granularity,
+        region,
+        ce_api_dump=ce_api_dump,
+        ce_api_label="simple:record_type",
+    )
     rt_by_type = rollup_record_type_totals(rt_payload["ResultsByTime"], display_metric)
     rt_periods_list = rt_payload.get("ResultsByTime", [])
+
+    cr_svc: dict[str, float] = {}
+    cr_uty: dict[str, float] = {}
+    if ce_api_dump is not None:
+        cr_svc, cr_uty = _append_credit_attribution_dumps(
+            start_date,
+            end_date,
+            service,
+            region,
+            granularity,
+            display_metric,
+            float(rt_by_type.get("Credit", 0.0)),
+            ce_api_dump,
+        )
+        if out_summary is not None and (cr_svc or cr_uty or abs(float(rt_by_type.get("Credit", 0.0))) >= 0.005):
+            console.print(
+                "[dim]JSON dump: added credit:by_service and credit:by_usage_type (RECORD_TYPE=Credit).[/dim]"
+            )
 
     net_roll, charges_roll, credits_roll = rollup_net_charges_credits(
         cost_data["ResultsByTime"], display_metric
     )
     console.print(
-        f"[dim]Rollup (by SERVICE rows): net {_format_net_usd(net_roll)} • gross charges "
-        f"{_format_net_usd(charges_roll)} • credits/refunds {_format_net_usd(credits_roll)}[/dim]"
+        "[dim]Rollup (by SERVICE rows):[/dim] "
+        f"net {_rich_usd_positive_red_negative_green(net_roll)} "
+        f"[dim]• gross charges[/dim] [red]{_format_net_usd(charges_roll)}[/red] "
+        f"[dim]• credits/refunds[/dim] [green]{_format_net_usd(credits_roll)}[/green]"
     )
     rt_parts = []
     for key in ("Usage", "Credit", "Refund", "Tax", "Distributor Discount"):
         if key in rt_by_type and abs(rt_by_type[key]) >= 0.005:
-            rt_parts.append(f"{key} {_format_net_usd(rt_by_type[key])}")
+            rt_parts.append(f"{key} {_rich_usd_record_type_row(key, rt_by_type[key])}")
     if rt_parts:
         console.print(
             "[dim]RECORD_TYPE (Billing home / CE “Usage vs credits” style): "
@@ -1261,7 +1584,7 @@ def analyze_costs_simple(
     # Display summary table
     summary_table = Table(title="Monthly Summary", expand=True)
     summary_table.add_column("Month", style="cyan")
-    summary_table.add_column("Net", justify="right", style="green")
+    summary_table.add_column("Net", justify="right")
     summary_table.add_column("Usage (REC)", justify="right", style="red")
     summary_table.add_column("Credits (REC)", justify="right", style="green")
     summary_table.add_column("Bar (red=paid · green=credits)", ratio=1)
@@ -1271,25 +1594,25 @@ def analyze_costs_simple(
         bar = _monthly_rec_usage_credit_bar(usage_rt, cred_rt, console.width)
         summary_table.add_row(
             label,
-            _format_net_usd(total),
+            _rich_usd_positive_red_negative_green(total),
             _format_net_usd(usage_rt),
             _format_net_usd(cred_rt),
             bar,
         )
 
     summary_table.add_row(
-        "GRAND TOTAL",
-        _format_net_usd(grand_total),
-        _format_net_usd(grand_usage_rt),
-        _format_net_usd(grand_cred_rt),
+        "[bold]GRAND TOTAL[/bold]",
+        _rich_usd_signed_bold(grand_total),
+        f"[bold red]{_format_net_usd(grand_usage_rt)}[/bold red]",
+        f"[bold green]{_format_net_usd(grand_cred_rt)}[/bold green]",
         _monthly_rec_usage_credit_bar(grand_usage_rt, grand_cred_rt, console.width),
-        style="bold",
     )
 
     summary_table.caption = (
         "[dim]Net = sum of SERVICE lines (often ~$0 after credits). "
         "Usage (REC) / Credits (REC) = Cost Explorer RECORD_TYPE (Billing MTD). "
-        "Bar: [red]red[/red] = share of Usage (paid), [green]green[/green] = share of |Credits|.[/dim]"
+        "Bar: [red]red[/red] = net after credits vs (net+|credits|); "
+        "[green]green[/green] = |credits| share.[/dim]"
     )
 
     console.print(summary_table)
@@ -1323,7 +1646,7 @@ def analyze_costs_simple(
         for item_name, amount in top_items:
             percentage = (amount / insight_denom) * 100
             console.print(
-                f"• [cyan]{item_name}[/cyan]: ${amount:.2f} "
+                f"• [cyan]{item_name}[/cyan]: [red]${amount:.2f}[/red] "
                 f"([bold]{percentage:.1f}%[/bold] of {pct_basis})"
             )
 
@@ -1333,5 +1656,17 @@ def analyze_costs_simple(
 
     if reconcile:
         print_ce_reconciliation(
-            console, start_date, end_date, service, region, granularity, metric_preference
+            console,
+            start_date,
+            end_date,
+            service,
+            region,
+            granularity,
+            metric_preference,
+            ce_api_dump=ce_api_dump,
+        )
+
+    if out_summary is not None:
+        _fill_json_out_summary(
+            out_summary, start_date, end_date, display_metric, rt_payload, cr_svc, cr_uty
         )

@@ -6,10 +6,18 @@ Main entry point for the AWS Cost Lens CLI tool.
 """
 
 import argparse
+import json
 import sys
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
 
-from aws_cost_lens.core import analyze_costs_detailed, analyze_costs_simple, list_available_services
+from aws_cost_lens.core import (
+    analyze_costs_detailed,
+    analyze_costs_simple,
+    ce_api_json_default,
+    list_available_services,
+)
 
 METRIC_CHOICES = (
     "auto",
@@ -114,6 +122,16 @@ def parse_args():
             "rollup lines when applicable."
         ),
     )
+    parser.add_argument(
+        "--out",
+        choices=["json"],
+        default=None,
+        help=(
+            "After the run, write to logs/ce-api-<timestamp>.json: `calls` (raw get_cost_and_usage), "
+            "and `summary` (RECORD_TYPE rollups, credit by SERVICE and USAGE_TYPE, hints vs Billing console). "
+            "Use to inspect exact API payloads."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -141,9 +159,39 @@ def main():
         else:
             end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
+        ce_api_dump: Optional[list[dict]] = [] if args.out == "json" else None
+        ce_out_summary: Optional[dict] = {} if args.out == "json" else None
+
+        def _write_api_json(mode: str) -> None:
+            if ce_api_dump is None:
+                return
+            log_dir = Path("logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+            out_path = log_dir / f"ce-api-{stamp}.json"
+            payload = {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "mode": mode,
+                "start_date": start_date,
+                "end_date": end_date,
+                "argv": sys.argv,
+                "calls": ce_api_dump,
+                "summary": ce_out_summary,
+            }
+            out_path.write_text(
+                json.dumps(payload, indent=2, default=ce_api_json_default) + "\n",
+                encoding="utf-8",
+            )
+            print(f"Wrote Cost Explorer API dump to {out_path.resolve()}", file=sys.stderr)
+
         # If user requested to list services, do that and exit
         if args.list_services:
-            list_available_services(start_date, end_date, args.region, args.metric)
+            list_available_services(
+                start_date, end_date, args.region, args.metric, ce_api_dump=ce_api_dump
+            )
+            if ce_out_summary is not None:
+                ce_out_summary["status"] = "list_services_only"
+            _write_api_json("list_services")
             return 0
 
         # Use the service parameter directly - if None, it will show all services
@@ -162,7 +210,10 @@ def main():
                 region=args.region,
                 metric_preference=args.metric,
                 reconcile=args.reconcile,
+                ce_api_dump=ce_api_dump,
+                out_summary=ce_out_summary,
             )
+            _write_api_json("detailed")
         else:
             analyze_costs_simple(
                 start_date=start_date,
@@ -174,7 +225,10 @@ def main():
                 region=args.region,
                 metric_preference=args.metric,
                 reconcile=args.reconcile,
+                ce_api_dump=ce_api_dump,
+                out_summary=ce_out_summary,
             )
+            _write_api_json("simple")
 
         return 0
     except KeyboardInterrupt:

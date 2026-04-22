@@ -79,6 +79,26 @@ def test_get_cost_data_region_and_service_uses_and_filter(mock_ce_response):
     assert len(call_kw["Filter"]["And"]) == 2
 
 
+def test_get_cost_data_record_type_filter_and_with_service(mock_ce_response):
+    mock_client = MagicMock()
+    mock_client.get_cost_and_usage.return_value = mock_ce_response
+
+    with patch("aws_cost_lens.core.boto3.client", return_value=mock_client):
+        get_cost_data(
+            "2026-03-01",
+            "2026-04-01",
+            "s3",
+            "SERVICE",
+            record_type_values=["Credit"],
+        )
+
+    call_kw = mock_client.get_cost_and_usage.call_args.kwargs
+    and_parts = call_kw["Filter"]["And"]
+    assert len(and_parts) == 2
+    assert {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}} in and_parts
+    assert {"Dimensions": {"Key": "SERVICE", "Values": ["AmazonS3"]}} in and_parts
+
+
 def test_get_cost_data_ungrouped_omits_group_by(mock_ce_response):
     mock_client = MagicMock()
     mock_client.get_cost_and_usage.return_value = mock_ce_response
