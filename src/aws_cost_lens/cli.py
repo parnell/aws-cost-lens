@@ -64,6 +64,17 @@ def parse_args():
         help="Show only top N services/usage types (default: 0 for all)",
     )
     parser.add_argument(
+        "--cost-filter",
+        type=float,
+        default=0.0,
+        metavar="USD",
+        help=(
+            "Monthly service bar tables (simple mode): hide per-service rows when "
+            "max(Usage, |Credits|) is below this USD amount; combine those rows into "
+            "'All other services'. 0 disables (default)."
+        ),
+    )
+    parser.add_argument(
         "--all-services", action="store_true", help="Show all services instead of just CloudWatch"
     )
     parser.add_argument(
@@ -237,6 +248,7 @@ def main():
                 verbose=args.verbose,
                 ce_api_dump=ce_api_dump,
                 out_summary=ce_out_summary,
+                cost_filter_min=args.cost_filter,
             )
             _write_api_json("simple")
 

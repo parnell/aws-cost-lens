@@ -1,6 +1,6 @@
 """Tests for monthly summary formatting helpers."""
 
-from aws_cost_lens.core import _format_net_usd, _monthly_summary_bar
+from aws_cost_lens.summary_bars import _format_net_usd, _monthly_summary_bar
 
 
 def test_format_net_usd_near_zero():

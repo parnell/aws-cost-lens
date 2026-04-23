@@ -1,24 +1,49 @@
-"""Tests for RECORD_TYPE monthly summary bar (net vs credits, near-zero handling)."""
+"""Tests for RECORD_TYPE monthly summary bars (scaled, green/red coverage split)."""
 
-from aws_cost_lens.core import _monthly_rec_usage_credit_bar
+from aws_cost_lens.summary_bars import (
+    _monthly_summary_rec_max_magnitude,
+    _service_rec_coverage_bar,
+)
 
 
-def test_bar_uses_net_and_credit_magnitude_not_gross_usage():
-    """$134 usage + $-100 credits → net $34.15 vs $100 credit → ~1/4 red (not ~57% gross-of-usage)."""
-    t = _monthly_rec_usage_credit_bar(134.15, -100.0, 120)
-    # Width 40: net/(net+|credit|) = 34.15/134.15 ≈ 25% red → 10 red, 30 green (not 23+17).
+def test_coverage_bar_green_red_split_at_full_scale():
+    """$134 usage + $-100 credits → ~75% credit-cover (green) vs ~25% OOP (red) of gross usage."""
+    t = _service_rec_coverage_bar(134.15, -100.0, 120, max_magnitude=134.15)
     assert len(t.spans) == 2
-    assert t.spans[0].style == "red" and t.spans[0].end - t.spans[0].start == 10
-    assert t.spans[1].style == "green" and t.spans[1].end - t.spans[1].start == 30
+    assert t.spans[0].style == "green" and t.spans[0].end - t.spans[0].start == 30
+    assert t.spans[1].style == "red" and t.spans[1].end - t.spans[1].start == 10
     assert t.plain == "█" * 40
 
 
+def test_summary_max_magnitude_includes_grand_total():
+    totals = [
+        ("Jan", 0.0, False, 100.0, -100.0),
+        ("Feb", 0.0, False, 500.0, -500.0),
+    ]
+    assert _monthly_summary_rec_max_magnitude(totals, 600.0, -600.0) == 600.0
+
+
+def test_summary_month_row_shorter_than_grand():
+    mx = _monthly_summary_rec_max_magnitude(
+        [
+            ("Mar", 0.0, False, 3000.0, -3000.0),
+            ("Apr", 0.0, False, 1000.0, -1000.0),
+        ],
+        4000.0,
+        -4000.0,
+    )
+    assert mx == 4000.0
+    t_grand = _service_rec_coverage_bar(4000.0, -4000.0, 120, mx)
+    t_month = _service_rec_coverage_bar(1000.0, -1000.0, 120, mx)
+    assert len(t_grand.plain) == 40
+    assert len(t_month.plain) == 10
+
+
 def test_bar_suppressed_when_display_would_be_zero_noise():
-    """Sub-cent floats that round to $0.00 must not produce a 50/50 bar."""
-    t = _monthly_rec_usage_credit_bar(0.002, -0.002, 120)
+    t = _service_rec_coverage_bar(0.002, -0.002, 120, max_magnitude=1.0)
     assert t.plain.strip() == "—"
 
 
 def test_bar_suppressed_when_both_zero():
-    t = _monthly_rec_usage_credit_bar(0.0, 0.0, 120)
+    t = _service_rec_coverage_bar(0.0, 0.0, 120, max_magnitude=1.0)
     assert t.plain.strip() == "—"
