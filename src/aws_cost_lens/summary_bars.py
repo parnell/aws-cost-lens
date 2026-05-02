@@ -127,10 +127,10 @@ def _service_rec_coverage_bar(
     t = Text()
     w = max(12, min(40, int(console_width / 3)))
     scale = float(max_magnitude) if max_magnitude >= near else 1.0
-    row_len = max(1, min(w, int(round(w * (mag_for_len / scale)))))
+    row_len = max(1, min(w, round(w * (mag_for_len / scale))))
 
     if u >= near:
-        n_cov = int(round(row_len * (covered / u)))
+        n_cov = round(row_len * (covered / u))
         n_oop = row_len - n_cov
         if oop >= near and covered >= near:
             if n_cov == 0:
@@ -250,8 +250,8 @@ def create_service_record_type_split_table(
     cost_filter_min: float = 0.0,
 ) -> Table:
     """
-    One monthly table: **Usage** from ``RECORD_TYPE=Usage`` × SERVICE; **Credits** from
-    ``RECORD_TYPE=Credit`` and ``Refund`` × SERVICE. Row amounts sum (by column) to the same
+    One monthly table: **Usage** from ``RECORD_TYPE=Usage`` by SERVICE; **Credits** from
+    ``RECORD_TYPE=Credit`` and ``Refund`` by SERVICE. Row amounts sum (by column) to the same
     RECORD_TYPE totals as :func:`rollup_record_type_totals` for that month, apart from line items
     not allocated to SERVICE (e.g. some tax rows).
 
@@ -380,12 +380,14 @@ def create_service_record_type_split_table(
         table.add_row(name, usage_s, cred_s, bar_cell)
 
     if show_all and zero_count > 0:
-        table.caption = f"Showing all services including {zero_count} with near-zero Usage and Credits"
+        table.caption = (
+            f"Showing all services including {zero_count} with near-zero Usage and Credits"
+        )
 
     if verbose:
         cap_bits = [
-            "Columns: [red]Usage[/red] = SERVICE × RECORD_TYPE Usage; "
-            "[green]Credits[/green] = SERVICE × (Credit + Refund). "
+            "Columns: [red]Usage[/red] = SERVICE by RECORD_TYPE Usage; "
+            "[green]Credits[/green] = SERVICE by (Credit + Refund). "
             "Bar: length scales to the largest service/credit line in the table; "
             "[green]green[/green] = usage covered by credits; [red]red[/red] = out-of-pocket."
         ]

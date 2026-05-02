@@ -146,8 +146,9 @@ def parse_args():
         choices=["json"],
         default=None,
         help=(
-            "After the run, write to logs/ce-api-<timestamp>.json: `calls` (raw get_cost_and_usage), "
-            "and `summary` (RECORD_TYPE rollups, credit by SERVICE and USAGE_TYPE, hints vs Billing console). "
+            "After the run, write to logs/ce-api-<timestamp>.json: `calls` "
+            "(raw get_cost_and_usage), and `summary` (RECORD_TYPE rollups, "
+            "credit by SERVICE and USAGE_TYPE, hints vs Billing console). "
             "Use to inspect exact API payloads."
         ),
     )

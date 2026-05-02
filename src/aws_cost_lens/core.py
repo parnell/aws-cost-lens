@@ -501,8 +501,8 @@ def _fill_json_out_summary(
             "implied_net_after_credits_refunds_and_tax": u + c + tax,
         }
     out["cost_management_ui_hint"] = (
-        "The Billing home “Cost summary” / “Month-to-date cost” figure is often the same order of "
-        "magnitude as **RECORD_TYPE=Usage** (gross) for the month so far, using the console’s "
+        'The Billing home "Cost summary" / "Month-to-date cost" figure is often the same order of '
+        "magnitude as **RECORD_TYPE=Usage** (gross) for the month so far, using the console's "
         "default cost type; it may not list **RECORD_TYPE=Credit** on that card. In Cost "
         "Explorer, net is reflected across line types: Usage + Credit + Refund + Tax "
         "(and any other record types in your data). For per-invoice or grant names, use "
@@ -651,7 +651,7 @@ def create_cost_table(
     **negative** rows against the largest |negative| line.
 
     ``record_type_for_period`` (Usage / Credit / …) adds a caption tying SERVICE rows to
-    CE’s billing-style RECORD_TYPE totals for the same window.
+    CE's billing-style RECORD_TYPE totals for the same window.
     """
     period_start = period_data["TimePeriod"]["Start"]
     period_display = format_date_period(period_start, granularity)
@@ -764,7 +764,8 @@ def create_cost_table(
     if verbose:
         cap_bits = [
             "Bar: [red]red[/red] = usage (paid) vs largest usage in table; "
-            "[green]green[/green] = |credits| vs largest |credit| line (separate scales side by side)."
+            "[green]green[/green] = |credits| vs largest |credit| line "
+            "(separate scales side by side)."
         ]
         if group_by == "SERVICE" and record_type_for_period:
             u = record_type_for_period.get("Usage")
@@ -775,7 +776,8 @@ def create_cost_table(
                 cap_bits.append(
                     "RECORD_TYPE for this period: Usage "
                     f"[red]{_format_net_usd(u)}[/red] • Credits/refunds "
-                    f"[green]{_format_net_usd(cr)}[/green] (SERVICE rows allocate credits unevenly)."
+                    f"[green]{_format_net_usd(cr)}[/green] "
+                    "(SERVICE rows allocate credits unevenly)."
                 )
         if table.caption:
             table.caption += "\n" + " ".join(cap_bits)
@@ -1299,7 +1301,8 @@ def print_ce_reconciliation(
         f"[dim]Per-period [bold]Net[/bold] uses {dm_ungrouped!s} on the ungrouped CE response. "
         f"RECORD_TYPE [bold]Usage[/bold] / [bold]Credits[/bold] (Credit + Refund) are gross "
         f"components (often large and offsetting; net is small). Unblended $0.00 in old-style "
-        f"tables is common when the account nets to ~$0; use Net and the Usage / Credits columns.[/dim]"
+        f"tables is common when the account nets to ~$0; use Net and the Usage / Credits "
+        f"columns.[/dim]"
     )
 
     for period in periods:
@@ -1572,8 +1575,9 @@ def analyze_costs_simple(
 
     if insight_denom > 0.01 and top_items:
         console.print("\n[bold]Cost Breakdown Insights:[/bold]")
+        denom_s = _format_net_usd(insight_denom)
         console.print(
-            f"[dim]Percentages are of RECORD_TYPE Usage over the range (~{_format_net_usd(insight_denom)}).[/dim]"
+            f"[dim]Percentages are of RECORD_TYPE Usage over the range (~{denom_s}).[/dim]"
         )
 
         pct_basis = "RECORD_TYPE Usage"
