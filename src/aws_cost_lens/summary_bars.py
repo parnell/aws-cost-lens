@@ -386,8 +386,8 @@ def create_service_record_type_split_table(
 
     if verbose:
         cap_bits = [
-            "Columns: [red]Usage[/red] = SERVICE for RECORD_TYPE Usage; "
-            "[green]Credits[/green] = SERVICE for (Credit + Refund). "
+            "Columns: [red]Usage[/red] = SERVICE by RECORD_TYPE Usage; "
+            "[green]Credits[/green] = SERVICE by (Credit + Refund). "
             "Bar: length scales to the largest service/credit line in the table; "
             "[green]green[/green] = usage covered by credits; [red]red[/red] = out-of-pocket."
         ]
