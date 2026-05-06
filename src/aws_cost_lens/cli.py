@@ -10,13 +10,13 @@ import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from aws_cost_lens.core import (
     analyze_costs_detailed,
     analyze_costs_simple,
     ce_api_json_default,
     list_available_services,
+    normalize_ce_time_period_bound,
 )
 
 METRIC_CHOICES = (
@@ -33,14 +33,20 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Analyze AWS costs")
     parser.add_argument(
-        "-s", "--start-date", help="Start date (YYYY-MM-DD), defaults to 6 months ago"
+        "-s",
+        "--start-date",
+        help=(
+            "Start of the Cost Explorer window (flexible-datetime: e.g. YYYY-MM-DD, YYYY/MM/DD, "
+            "ISO datetime). Defaults to 6 months ago."
+        ),
     )
     parser.add_argument(
         "-e",
         "--end-date",
         help=(
-            "End date (YYYY-MM-DD). Cost Explorer uses an exclusive end; omitting this defaults "
-            "to tomorrow so totals include usage through today (same window as most console views)."
+            "Exclusive end of the Cost Explorer window (flexible-datetime). Omit to default to "
+            "tomorrow's date so totals include usage through today "
+            "(same idea as most console views)."
         ),
     )
     parser.add_argument(
@@ -169,18 +175,18 @@ def main():
 
         # Default to 6 months ago if no start date provided
         if args.start_date:
-            start_date = args.start_date
+            start_date = normalize_ce_time_period_bound(args.start_date)
         else:
             start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
 
         # CE TimePeriod.End is exclusive; default to tomorrow so "through today" is included.
         if args.end_date:
-            end_date = args.end_date
+            end_date = normalize_ce_time_period_bound(args.end_date)
         else:
             end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
-        ce_api_dump: Optional[list[dict]] = [] if args.out == "json" else None
-        ce_out_summary: Optional[dict] = {} if args.out == "json" else None
+        ce_api_dump: list[dict] | None = [] if args.out == "json" else None
+        ce_out_summary: dict | None = {} if args.out == "json" else None
 
         def _write_api_json(mode: str) -> None:
             if ce_api_dump is None:

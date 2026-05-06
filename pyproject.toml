@@ -3,7 +3,7 @@ name = "aws-cost-lens"
 version = "0.1.6"
 description = "AWS Cost Explorer Analysis Tool"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {file = "LICENSE"}
 keywords = ["aws", "cost", "billing", "cloud"]
 classifiers = [
@@ -13,7 +13,6 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -22,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "boto3>=1.28.0",
+    "flexible-datetime>=1.1.1",
     "rich>=13.0.0",
     "tqdm>=4.66.0",
 ]
@@ -49,7 +49,7 @@ testpaths = ["tests"]
 pythonpath = ["src", "."]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]

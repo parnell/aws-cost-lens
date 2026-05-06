@@ -5,12 +5,13 @@ Core functionality for displaying AWS costs by service and usage type with rich 
 """
 
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Any, NamedTuple
 
 import boto3
+from flexible_datetime import flex_datetime
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -30,6 +31,28 @@ from .summary_bars import (
 
 # AWS Cost Explorer limits
 MAX_HOURLY_GRANULARITY_DAYS = 14
+
+
+def _parse_ce_time_bound_to_utc(value: str) -> datetime:
+    """Parse a Cost Explorer TimePeriod bound using flexible-datetime (returns UTC, no micros)."""
+    dt = flex_datetime(value).to_datetime()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    else:
+        dt = dt.astimezone(UTC)
+    return dt.replace(microsecond=0)
+
+
+def normalize_ce_time_period_bound(value: str) -> str:
+    """
+    Parse a start/end string and return a CE-friendly value: ``YYYY-MM-DD`` at UTC midnight,
+    else ``YYYY-MM-DDTHH:MM:SSZ``.
+    """
+    dt = _parse_ce_time_bound_to_utc(value)
+    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        return dt.strftime("%Y-%m-%d")
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 # Request these in one GetCostAndUsage call. Unblended / Blended / NetUnblended are the
 # classic cash-style metrics; Amortized / NetAmortized spread RI and Savings Plans commitment
@@ -334,18 +357,23 @@ def get_cost_data(
         try:
             ce_client = boto3.client("ce")
 
+            start_date = normalize_ce_time_period_bound(start_date)
+            end_date = normalize_ce_time_period_bound(end_date)
+
             # Format dates correctly for HOURLY granularity
             # AWS Cost Explorer API expects timestamps in ISO 8601 format for HOURLY
             if granularity == "HOURLY":
-                # Convert dates to datetime objects
-                start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
-                end_datetime = datetime.strptime(end_date, "%Y-%m-%d")
+                # Convert dates to datetime objects (bounds are already CE-normalized strings)
+                start_datetime = _parse_ce_time_bound_to_utc(start_date)
+                end_datetime = _parse_ce_time_bound_to_utc(end_date)
+
+                today = datetime.now().astimezone()
+                start_local = start_datetime.astimezone(today.tzinfo)
+                end_local = end_datetime.astimezone(today.tzinfo)
 
                 # Check if range is within 14 days
-                days_diff = (end_datetime - start_datetime).days
-
-                today = datetime.now()
-                days_from_today_start = (today - start_datetime).days
+                days_diff = (end_local - start_local).days
+                days_from_today_start = (today - start_local).days
 
                 if (
                     days_diff > MAX_HOURLY_GRANULARITY_DAYS
@@ -364,10 +392,10 @@ def get_cost_data(
                     start_date = start_datetime.strftime("%Y-%m-%dT00:00:00Z")
 
                     # If end date is today, use current time, otherwise use end of day
-                    if (end_datetime.date() - today.date()).days == 0:
+                    if (end_local.date() - today.date()).days == 0:
                         end_date = today.strftime("%Y-%m-%dT%H:%M:%SZ")
                     else:
-                        end_date = end_datetime.strftime("%Y-%m-%dT23:59:59Z")
+                        end_date = end_local.strftime("%Y-%m-%dT23:59:59Z")
 
             # Base request parameters
             request_params = {
@@ -519,7 +547,7 @@ def _fill_json_out_summary(
         nt = float(mri["implied_net_after_credits_refunds_and_tax"])
         out["one_line_mtd_reconciliation"] = (
             f"Gross (RECORD_TYPE Usage) ≈ ${ug:.2f}; net (Usage+Credit+Refund+Tax) ≈ "
-            f"${nt:.2f} for the window. The Billing “Month-to-date cost” number is often close to "
+            f'${nt:.2f} for the window. The Billing "Month-to-date cost" number is often close to '
             f"**gross**; credits are easy to miss on that card. Ungrouped Cost Explorer (see "
             f"`reconcile:ungrouped_total` in `calls`) should match **net** ≈ ${nt:.2f}."
         )
@@ -987,7 +1015,7 @@ def analyze_costs_detailed(
             rt_parts.append(f"{key} {_rich_usd_record_type_row(key, rt_by_type[key])}")
     if rt_parts:
         console.print(
-            "[dim]RECORD_TYPE (Billing home / CE “Usage vs credits” style): "
+            '[dim]RECORD_TYPE (Billing home / CE "Usage vs credits" style): '
             + " • ".join(rt_parts)
             + "[/dim]"
         )
@@ -1238,13 +1266,13 @@ def print_ce_reconciliation(
     """
     Show official CE ``Total`` lines (no GROUP BY) and a ``RECORD_TYPE`` breakdown.
 
-    AWS does not publish a separate public API for the Billing console “Cost summary” card or
+    AWS does not publish a separate public API for the Billing console "Cost summary" card or
     finalized invoices; Cost Explorer is the supported usage/cost API. Invoice-style detail is
     available via Cost & Usage Reports (S3) for accounts that enable CUR.
     """
     console.print("\n[bold]Reconciliation — Cost Explorer API only[/bold]")
     console.print(
-        "[dim]There is no separate boto3 “billing dashboard” total. These rows are still "
+        '[dim]There is no separate boto3 "billing dashboard" total. These rows are still '
         "``ce:GetCostAndUsage``. Enable Cost & Usage Reports to S3 for invoice/CUR-aligned "
         "data.[/dim]"
     )
@@ -1482,7 +1510,7 @@ def analyze_costs_simple(
             rt_parts.append(f"{key} {_rich_usd_record_type_row(key, rt_by_type[key])}")
     if rt_parts:
         console.print(
-            "[dim]RECORD_TYPE (Billing home / CE “Usage vs credits” style): "
+            '[dim]RECORD_TYPE (Billing home / CE "Usage vs credits" style): '
             + " • ".join(rt_parts)
             + "[/dim]"
         )
