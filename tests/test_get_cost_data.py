@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aws_cost_lens.core import CE_METRICS_BUNDLE, get_cost_data
+from aws_cost_lens.core import CE_METRICS_BUNDLE, get_cost_data, normalize_ce_time_period_bound
 from tests.fixtures import load_ce_fixture
 
 
@@ -97,6 +97,29 @@ def test_get_cost_data_record_type_filter_and_with_service(mock_ce_response):
     assert len(and_parts) == 2
     assert {"Dimensions": {"Key": "RECORD_TYPE", "Values": ["Credit"]}} in and_parts
     assert {"Dimensions": {"Key": "SERVICE", "Values": ["AmazonS3"]}} in and_parts
+
+
+def test_normalize_ce_time_period_bound_flexible_dates():
+    assert normalize_ce_time_period_bound("2026/03/01") == "2026-03-01"
+    assert normalize_ce_time_period_bound("2026-03-01T14:30:00Z") == "2026-03-01T14:30:00Z"
+    assert normalize_ce_time_period_bound("Mar 1, 2026") == "2026-03-01"
+
+
+def test_get_cost_data_normalizes_flexible_time_period(mock_ce_response):
+    mock_client = MagicMock()
+    mock_client.get_cost_and_usage.return_value = mock_ce_response
+
+    with patch("aws_cost_lens.core.boto3.client", return_value=mock_client):
+        get_cost_data(
+            "2026/03/01",
+            "2026/04/01",
+            None,
+            None,
+            granularity="MONTHLY",
+        )
+
+    tp = mock_client.get_cost_and_usage.call_args.kwargs["TimePeriod"]
+    assert tp == {"Start": "2026-03-01", "End": "2026-04-01"}
 
 
 def test_get_cost_data_ungrouped_omits_group_by(mock_ce_response):

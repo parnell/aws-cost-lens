@@ -184,7 +184,10 @@ def test_coverage_bar_scales_down_when_not_max_row():
 
 def test_find_matching_period_falls_back_to_empty_groups():
     canonical = {"TimePeriod": {"Start": "2026-04-01", "End": "2026-05-01"}, "Groups": []}
-    other = {"TimePeriod": {"Start": "2026-03-01", "End": "2026-04-01"}, "Groups": [{"Keys": ["X"]}]}
+    other = {
+        "TimePeriod": {"Start": "2026-03-01", "End": "2026-04-01"},
+        "Groups": [{"Keys": ["X"]}],
+    }
     got = _find_matching_period([other], canonical)
     assert got["Groups"] == []
     assert got["TimePeriod"] == canonical["TimePeriod"]
