@@ -11,6 +11,8 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import boto3
+
 from aws_cost_lens.core import (
     analyze_costs_detailed,
     analyze_costs_simple,
@@ -94,8 +96,16 @@ def parse_args():
         help="(Default behavior) Show simplified service-level breakdown",
     )
     parser.add_argument(
-        "--region", 
+        "--region",
         help="Filter results to a specific AWS region (e.g., us-east-1)"
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help=(
+            "AWS named profile from ~/.aws/config (same as `aws --profile`). "
+            "Use this to pick an identity that can call ce:GetCostAndUsage."
+        ),
     )
     parser.add_argument(
         "--show-region", 
@@ -161,6 +171,13 @@ def parse_args():
     return parser.parse_args()
 
 
+def configure_aws_profile(profile: str | None) -> None:
+    """Point boto3's default session at a named shared-config profile."""
+    if not profile:
+        return
+    boto3.setup_default_session(profile_name=profile)
+
+
 def main():
     """Main entry point for the CLI."""
     try:
@@ -172,6 +189,8 @@ def main():
 
             print(f"AWS Cost Lens version {__version__}")
             return 0
+
+        configure_aws_profile(args.profile)
 
         # Default to 6 months ago if no start date provided
         if args.start_date:

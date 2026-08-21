@@ -1,6 +1,7 @@
 """CLI argument parsing."""
 
 import sys
+from unittest.mock import patch
 
 
 def test_parse_args_detailed_flag(monkeypatch):
@@ -23,6 +24,30 @@ def test_parse_args_defaults(monkeypatch):
     assert args.metric == "unblended"
     assert args.reconcile is True
     assert args.verbose is False
+    assert args.profile is None
+
+
+def test_parse_args_profile(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["aws-cost-lens", "--profile", "billing-admin"])
+    from aws_cost_lens.cli import parse_args
+
+    assert parse_args().profile == "billing-admin"
+
+
+def test_configure_aws_profile_sets_default_session():
+    from aws_cost_lens.cli import configure_aws_profile
+
+    with patch("aws_cost_lens.cli.boto3.setup_default_session") as setup:
+        configure_aws_profile("billing-admin")
+    setup.assert_called_once_with(profile_name="billing-admin")
+
+
+def test_configure_aws_profile_noop_when_omitted():
+    from aws_cost_lens.cli import configure_aws_profile
+
+    with patch("aws_cost_lens.cli.boto3.setup_default_session") as setup:
+        configure_aws_profile(None)
+    setup.assert_not_called()
 
 
 def test_parse_args_verbose(monkeypatch):
