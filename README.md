@@ -27,6 +27,9 @@ aws-cost-lens --list-services
 
 # Show top 10 most expensive services
 aws-cost-lens --top 10
+
+# Use a named AWS CLI profile (needs ce:GetCostAndUsage)
+aws-cost-lens --profile billing-admin
 ```
 
 ### Common Options
@@ -36,6 +39,7 @@ aws-cost-lens --top 10
 - `--end-date`: End date (YYYY-MM-DD), defaults to today
 - `--detailed`: Show detailed breakdown by SERVICE and USAGE_TYPE
 - `--region`: Include region breakdown in detailed analysis
+- `--profile`: AWS named profile (same as `aws --profile`)
 - `--top N`: Show only top N services/usage types
 - `--granularity`: Time granularity (DAILY, MONTHLY, HOURLY)
 - `--show-all`: Show all items including those with zero costs
@@ -47,7 +51,8 @@ AWS Cost Lens uses your AWS credentials from the environment. Make sure you have
 
 1. AWS CLI configured (`aws configure`)
 2. Or environment variables set (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, etc.)
-3. Appropriate IAM permissions for Cost Explorer API (`ce:GetCostAndUsage`)
+3. Or `--profile NAME` to use a named profile from `~/.aws/config`
+4. Appropriate IAM permissions for Cost Explorer API (`ce:GetCostAndUsage`)
 
 ## Features
 
