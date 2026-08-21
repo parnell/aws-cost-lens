@@ -284,7 +284,19 @@ def _products_cell(products: tuple[str, ...], *, limit: int = 3) -> str:
     return text
 
 
-def _remaining_vs_initial_bar(remaining: float, initial: float, width: int = 16) -> Text:
+def _credit_label(credit: AmazonCredit) -> str:
+    bits = [credit.description]
+    extra: list[str] = []
+    if credit.credit_type:
+        extra.append(credit.credit_type)
+    if credit.status and credit.status != "ENABLED":
+        extra.append(credit.status)
+    if extra:
+        bits.append(f"[dim]({' · '.join(extra)})[/dim]")
+    return f"{' '.join(bits)}\n{_products_cell(credit.products)}"
+
+
+def _remaining_vs_initial_bar(remaining: float, initial: float, width: int = 12) -> Text:
     t = Text()
     i = abs(initial)
     r = abs(remaining)
@@ -324,18 +336,6 @@ def credits_to_summary_dicts(credits: list[AmazonCredit]) -> list[dict[str, Any]
     return out
 
 
-def _credit_label(credit: AmazonCredit) -> str:
-    bits = [credit.description]
-    extra: list[str] = []
-    if credit.credit_type:
-        extra.append(credit.credit_type)
-    if credit.status and credit.status != "ENABLED":
-        extra.append(credit.status)
-    if extra:
-        bits.append(f"[dim]({' · '.join(extra)})[/dim]")
-    return " ".join(bits)
-
-
 def build_amazon_credits_table(
     credits: list[AmazonCredit],
     *,
@@ -352,11 +352,10 @@ def build_amazon_credits_table(
         title=f"Amazon Credits [dim]· Billing inventory ({scope})[/dim]",
         expand=True,
     )
-    table.add_column("Credit", style="cyan", ratio=2, no_wrap=False)
+    table.add_column("Credit", style="cyan", min_width=36)
     table.add_column("Remaining", justify="right", style="green", no_wrap=True)
     table.add_column("Initial", justify="right", no_wrap=True)
     table.add_column("Expires", no_wrap=True)
-    table.add_column("Applies to", ratio=2, no_wrap=False)
     table.add_column("Left", no_wrap=True)
 
     rem_total = 0.0
@@ -369,7 +368,6 @@ def build_amazon_credits_table(
             _format_net_usd(c.remaining),
             _format_net_usd(c.initial),
             _expiry_cell(c, now=clock),
-            _products_cell(c.products),
             _remaining_vs_initial_bar(c.remaining, c.initial),
         )
 
@@ -377,7 +375,6 @@ def build_amazon_credits_table(
         "[bold]TOTAL remaining[/bold]",
         f"[bold green]{_format_net_usd(rem_total)}[/bold green]",
         f"[bold]{_format_net_usd(init_total)}[/bold]",
-        "",
         "",
         _remaining_vs_initial_bar(rem_total, init_total),
     )
