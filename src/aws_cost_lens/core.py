@@ -17,6 +17,7 @@ from rich.panel import Panel
 from rich.table import Table
 from tqdm import tqdm
 
+from .amazon_credits import print_amazon_credits_section
 from .summary_bars import (
     _format_net_usd,
     _format_usage_credit_cells,
@@ -1019,6 +1020,9 @@ def analyze_costs_detailed(
             + " • ".join(rt_parts)
             + "[/dim]"
         )
+    print_amazon_credits_section(
+        console, start_date, end_date, out_summary=out_summary
+    )
 
     # Display costs for each month
     for period in cost_data["ResultsByTime"]:
@@ -1517,6 +1521,9 @@ def analyze_costs_simple(
     console.print(
         "[dim]Monthly service tables use RECORD_TYPE filters (Usage vs Credit+Refund per service) "
         "so column totals align with Usage / Credits in the summary.[/dim]"
+    )
+    print_amazon_credits_section(
+        console, start_date, end_date, out_summary=out_summary
     )
 
     # Display costs for each month

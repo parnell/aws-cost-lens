@@ -52,13 +52,16 @@ AWS Cost Lens uses your AWS credentials from the environment. Make sure you have
 1. AWS CLI configured (`aws configure`)
 2. Or environment variables set (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, etc.)
 3. Or `--profile NAME` to use a named profile from `~/.aws/config`
-4. Appropriate IAM permissions for Cost Explorer API (`ce:GetCostAndUsage`)
+4. Appropriate IAM permissions:
+   - Cost Explorer: `ce:GetCostAndUsage`
+   - Amazon Credits inventory (optional): `billing:GetCredits` in `us-east-1`. The account must also have [IAM access to Billing](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/control-access-billing.html) enabled. Without this, the report still runs; the Amazon Credits section is skipped.
 
 ## Features
 
 - Rich terminal UI with formatted tables and progress bars
 - Detailed cost breakdown by service, usage type, and region
 - Identify top cost contributors in your AWS account
+- Amazon Credits inventory (remaining / estimated balance, expiration, applicable services) from Billing `GetCredits`, alongside Cost Explorer credits already applied to usage
 - Get cost reduction tips for specific services
 - Filter by service name with smart alias matching
 - Customizable view options (simple/detailed, time range, etc.)

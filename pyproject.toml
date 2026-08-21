@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "boto3>=1.28.0",
+    "boto3>=1.43.41",
     "flexible-datetime>=1.1.1",
     "rich>=13.0.0",
     "tqdm>=4.66.0",
