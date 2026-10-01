@@ -60,6 +60,7 @@ AWS Cost Lens uses your AWS credentials from the environment. Make sure you have
 
 - Rich terminal UI with formatted tables and progress bars
 - Detailed cost breakdown by service, usage type, and region
+- Default report covers every linked account your credentials can see in Cost Explorer (the consolidated family, when you run as the payer). Each account gets its own tables and total, and the run lists those accounts. Service bars, month bars, and the grand total use a different green and a different red per account: green is usage covered by credits, red is out-of-pocket. Combined all-accounts tables stack those colors on each service and each month.
 - Identify top cost contributors in your AWS account
 - Amazon Credits inventory (remaining / estimated balance, expiration, applicable services) from Billing `GetCredits`, alongside Cost Explorer credits already applied to usage
 - Get cost reduction tips for specific services

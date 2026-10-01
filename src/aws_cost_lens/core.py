@@ -13,12 +13,15 @@ from typing import Any, NamedTuple
 import boto3
 from flexible_datetime import flex_datetime
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from tqdm import tqdm
 
 from .amazon_credits import print_amazon_credits_section
 from .summary_bars import (
+    AccountGrandSlice,
     _format_net_usd,
     _format_usage_credit_cells,
     _rich_usd_positive_red_negative_green,
@@ -26,6 +29,8 @@ from .summary_bars import (
     _rich_usd_signed_bold,
     _service_usage_credit_bar,
     _split_usage_credit,
+    account_color_pair,
+    build_accounts_grand_total_table,
     build_monthly_summary_table,
     create_service_record_type_split_table,
 )
@@ -1368,6 +1373,472 @@ def print_ce_reconciliation(
     console.print(rt_table)
 
 
+def split_by_linked_account(payload: dict) -> dict[str, dict]:
+    """
+    Split a ``GetCostAndUsage`` payload whose first group key is ``LINKED_ACCOUNT``.
+
+    Each account's payload looks like the second group key was the only ``GroupBy``
+    (``SERVICE`` or ``RECORD_TYPE``). Every account gets every time period, with empty
+    groups when that account had no rows in the period.
+    """
+    periods = payload.get("ResultsByTime") or []
+    account_ids: list[str] = []
+    seen: set[str] = set()
+    for period in periods:
+        for group in period.get("Groups") or []:
+            keys = list(group.get("Keys") or [])
+            if len(keys) < 2 or not keys[0] or keys[0] in seen:
+                continue
+            seen.add(keys[0])
+            account_ids.append(keys[0])
+    if not account_ids:
+        return {}
+
+    out: dict[str, dict] = {account_id: {"ResultsByTime": []} for account_id in account_ids}
+    for period in periods:
+        buckets: dict[str, list] = {account_id: [] for account_id in account_ids}
+        for group in period.get("Groups") or []:
+            keys = list(group.get("Keys") or [])
+            if len(keys) < 2 or keys[0] not in buckets:
+                continue
+            cloned = dict(group)
+            cloned["Keys"] = keys[1:]
+            buckets[keys[0]].append(cloned)
+        for account_id in account_ids:
+            new_period = {key: value for key, value in period.items() if key != "Groups"}
+            new_period["Groups"] = buckets[account_id]
+            out[account_id]["ResultsByTime"].append(new_period)
+    return out
+
+
+def _sum_metric_into(dest: dict, src: dict) -> None:
+    """Add Cost Explorer metric amounts from ``src`` into ``dest``."""
+    for name, block in src.items():
+        if not isinstance(block, dict):
+            continue
+        raw = block.get("Amount")
+        if raw in (None, ""):
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        unit = block.get("Unit") or "USD"
+        prev = dest.get(name) or {}
+        prev_raw = prev.get("Amount")
+        if prev_raw not in (None, ""):
+            val += float(prev_raw)
+        dest[name] = {"Amount": str(val), "Unit": unit}
+
+
+def collapse_linked_account_groups(payload: dict) -> dict:
+    """Drop the ``LINKED_ACCOUNT`` key and sum the remaining group (family totals)."""
+    merged_periods: list[dict] = []
+    for period in payload.get("ResultsByTime") or []:
+        by_key: dict[tuple, dict] = {}
+        order: list[tuple] = []
+        for group in period.get("Groups") or []:
+            keys = list(group.get("Keys") or [])
+            rest = tuple(keys[1:] if len(keys) >= 2 else keys)
+            if rest not in by_key:
+                order.append(rest)
+                by_key[rest] = {"Keys": list(rest), "Metrics": {}}
+            _sum_metric_into(by_key[rest]["Metrics"], group.get("Metrics") or {})
+        new_period = {key: value for key, value in period.items() if key != "Groups"}
+        new_period["Groups"] = [by_key[key] for key in order]
+        merged_periods.append(new_period)
+    return {"ResultsByTime": merged_periods}
+
+
+def lookup_organization_account_names(account_ids: list[str]) -> dict[str, str]:
+    """
+    Map account IDs to Organizations account names.
+
+    Returns whatever names ``ListAccounts`` allows. A member identity often cannot list
+    the organization; callers then show the account ID alone.
+    """
+    wanted = {account_id for account_id in account_ids if account_id}
+    names: dict[str, str] = {}
+    if not wanted:
+        return names
+    try:
+        org = boto3.client("organizations")
+        token: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {}
+            if token:
+                kwargs["NextToken"] = token
+            page = org.list_accounts(**kwargs)
+            for acc in page.get("Accounts") or []:
+                aid = str(acc.get("Id") or "")
+                name = str(acc.get("Name") or "")
+                if aid in wanted and name:
+                    names[aid] = name
+            token = page.get("NextToken")
+            if not token or wanted <= names.keys():
+                break
+    except Exception:
+        return names
+    return names
+
+
+def format_linked_account_label(account_id: str, names: dict[str, str]) -> str:
+    """``Name (123456789012)`` when the name is known, otherwise the account ID."""
+    name = names.get(account_id)
+    if name:
+        return f"{name} ({account_id})"
+    return account_id
+
+
+def _account_ids_in_order(*mappings: dict[str, dict]) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for mapping in mappings:
+        for account_id in mapping:
+            if account_id and account_id not in seen:
+                seen.add(account_id)
+                ids.append(account_id)
+    return ids
+
+
+def _payload_metric_sum(payload: dict, metric: str) -> float:
+    return sum(
+        _period_metric_total(period, metric) for period in payload.get("ResultsByTime") or []
+    )
+
+
+def _present_simple_account(
+    console: Console,
+    *,
+    cost_data: dict,
+    usage_svc_data: dict,
+    credit_svc_data: dict,
+    rt_payload: dict,
+    display_metric: str,
+    start_date: str,
+    end_date: str,
+    top: int,
+    show_all: bool,
+    granularity: str,
+    verbose: bool,
+    cost_filter_min: float,
+    out_summary: dict | None,
+    print_credits: bool,
+    print_table_note: bool,
+    account_label: str | None = None,
+    green_style: str = "green",
+    red_style: str = "red",
+) -> tuple[float, float, float]:
+    """Print one account's simple report. Returns ``(net, usage, credits)``."""
+    rt_periods_list = rt_payload.get("ResultsByTime", [])
+    rt_by_type = rollup_record_type_totals(rt_periods_list, display_metric)
+
+    net_roll, charges_roll, credits_roll = rollup_net_charges_credits(
+        cost_data.get("ResultsByTime") or [], display_metric
+    )
+    console.print(
+        "[dim]Rollup (by SERVICE rows):[/dim] "
+        f"net {_rich_usd_positive_red_negative_green(net_roll)} "
+        f"[dim]• gross charges[/dim] [red]{_format_net_usd(charges_roll)}[/red] "
+        f"[dim]• credits/refunds[/dim] [green]{_format_net_usd(credits_roll)}[/green]"
+    )
+    rt_parts = []
+    for key in ("Usage", "Credit", "Refund", "Tax", "Distributor Discount"):
+        if key in rt_by_type and abs(rt_by_type[key]) >= 0.005:
+            rt_parts.append(f"{key} {_rich_usd_record_type_row(key, rt_by_type[key])}")
+    if rt_parts:
+        console.print(
+            '[dim]RECORD_TYPE (Billing home / CE "Usage vs credits" style): '
+            + " • ".join(rt_parts)
+            + "[/dim]"
+        )
+    if print_table_note:
+        console.print(
+            "[dim]Monthly service tables use RECORD_TYPE filters (Usage vs Credit+Refund per "
+            "service) so column totals align with Usage / Credits in the summary.[/dim]"
+        )
+    if print_credits:
+        print_amazon_credits_section(console, start_date, end_date, out_summary=out_summary)
+
+    grand_total = 0.0
+    grand_usage_rt = 0.0
+    grand_cred_rt = 0.0
+    monthly_totals = []
+
+    cost_periods = cost_data.get("ResultsByTime") or []
+    usage_periods = usage_svc_data.get("ResultsByTime", [])
+    credit_periods = credit_svc_data.get("ResultsByTime", [])
+    for i, period in enumerate(cost_periods):
+        monthly_total = _period_metric_total(period, display_metric)
+
+        p_rt = (
+            rollup_record_type_totals([rt_periods_list[i]], display_metric)
+            if i < len(rt_periods_list)
+            else {}
+        )
+        usage_rt = p_rt.get("Usage", 0.0)
+        cred_rt = p_rt.get("Credit", 0.0) + p_rt.get("Refund", 0.0)
+
+        pu = _find_matching_period(usage_periods, period)
+        pc = _find_matching_period(credit_periods, period)
+        table = create_service_record_type_split_table(
+            pu,
+            pc,
+            console.width,
+            top,
+            show_all,
+            granularity,
+            display_metric,
+            record_type_for_period=p_rt,
+            verbose=verbose,
+            cost_filter_min=cost_filter_min,
+            account_label=account_label,
+            green_style=green_style,
+            red_style=red_style,
+        )
+        console.print(table)
+
+        period_start = period["TimePeriod"]["Start"]
+        month_name = format_date_period(period_start, granularity)
+
+        incomplete = should_show_in_progress(period_start, granularity)
+        grand_total += monthly_total
+        grand_usage_rt += usage_rt
+        grand_cred_rt += cred_rt
+        monthly_totals.append((month_name, monthly_total, incomplete, usage_rt, cred_rt))
+
+    summary_caption = (
+        "[dim]Net = sum of net SERVICE lines (usage and credits merged per service). "
+        "Usage / Credits = Cost Explorer RECORD_TYPE (Billing MTD). "
+        "Monthly service tables above match these columns (gross per service). "
+        "Bar length scales to the largest month or grand total; "
+        "[green]green[/green] = usage covered by credits; [red]red[/red] = out-of-pocket.[/dim]"
+    )
+    summary_title = "Monthly Summary"
+    if account_label:
+        summary_title = f"Monthly Summary · {escape(account_label)}"
+    console.print(
+        build_monthly_summary_table(
+            monthly_totals,
+            grand_total,
+            grand_usage_rt,
+            grand_cred_rt,
+            console.width,
+            verbose,
+            summary_caption if verbose else "",
+            title=summary_title,
+            green_style=green_style,
+            red_style=red_style,
+            account_label=account_label or "",
+        )
+    )
+
+    u_rt = float(rt_by_type.get("Usage", 0.0))
+    item_usage: dict[str, float] = {}
+    for period in usage_periods:
+        for group in period.get("Groups", []):
+            item_name = group["Keys"][0]
+            amount = _metric_amount(group, display_metric)
+            item_usage[item_name] = item_usage.get(item_name, 0.0) + amount
+
+    insight_denom = u_rt if u_rt > 0.01 else max(sum(item_usage.values()), 0.01)
+    sorted_pos = sorted(
+        [(k, v) for k, v in item_usage.items() if v > 0.01],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    top_items = sorted_pos[:5]
+
+    if insight_denom > 0.01 and top_items:
+        console.print("\n[bold]Cost Breakdown Insights:[/bold]")
+        denom_s = _format_net_usd(insight_denom)
+        console.print(
+            f"[dim]Percentages are of RECORD_TYPE Usage over the range (~{denom_s}).[/dim]"
+        )
+
+        pct_basis = "RECORD_TYPE Usage"
+        for item_name, amount in top_items:
+            percentage = (amount / insight_denom) * 100
+            console.print(
+                f"• [cyan]{item_name}[/cyan]: [red]${amount:.2f}[/red] "
+                f"([bold]{percentage:.1f}%[/bold] of {pct_basis})"
+            )
+
+            tip = get_cost_reduction_tip(item_name)
+            if tip:
+                console.print(f"  [yellow]Tip:[/yellow] {tip}")
+
+    return grand_total, grand_usage_rt, grand_cred_rt
+
+
+def _service_maps_to_period(canonical: dict, maps: list[dict[str, float]], metric: str) -> dict:
+    """One CE period whose groups are service totals summed across ``maps``."""
+    totals: dict[str, float] = {}
+    for amounts in maps:
+        for name, amount in amounts.items():
+            totals[name] = totals.get(name, 0.0) + amount
+    groups = [
+        {"Keys": [name], "Metrics": {metric: {"Amount": str(amount), "Unit": "USD"}}}
+        for name, amount in totals.items()
+    ]
+    return {"TimePeriod": canonical["TimePeriod"], "Groups": groups}
+
+
+def _print_combined_multi_account_tables(
+    console: Console,
+    account_ids: list[str],
+    by_cost: dict[str, dict],
+    by_usage: dict[str, dict],
+    by_credit: dict[str, dict],
+    by_rt: dict[str, dict],
+    display_metric: str,
+    top: int,
+    show_all: bool,
+    granularity: str,
+    verbose: bool,
+    cost_filter_min: float,
+    color_legend: str,
+    account_labels: list[str] | None = None,
+) -> None:
+    """
+    Service tables and a monthly summary for every linked account at once.
+
+    Each service bar and each month bar stacks that account's green and red.
+    """
+    anchor: list[dict] = []
+    for account_id in account_ids:
+        periods = (by_cost.get(account_id) or {}).get("ResultsByTime") or []
+        if periods:
+            anchor = periods
+            break
+    if not anchor:
+        return
+
+    console.print()
+    console.print(Rule("[bold]All accounts[/bold]"))
+    console.print(
+        "[dim]Each service and each month stacks every account's green (credits cover usage) "
+        "and red (out-of-pocket). Hold Option on a bar section to see that account and its "
+        "cost (usage and credits).[/dim]"
+    )
+    if color_legend:
+        console.print(color_legend)
+
+    monthly_totals: list[tuple] = []
+    account_bars: list[list[tuple]] = []
+    grand_total = 0.0
+    grand_usage = 0.0
+    grand_cred = 0.0
+    labels = list(account_labels) if account_labels is not None else list(account_ids)
+
+    for period in anchor:
+        per_maps: list[tuple[dict[str, float], dict[str, float], str, str, str]] = []
+        month_slices: list[tuple] = []
+        rt_sum: dict[str, float] = {}
+        net = 0.0
+        for index, account_id in enumerate(account_ids):
+            green_style, red_style = account_color_pair(index)
+            label = labels[index] if index < len(labels) else account_id
+            cost_periods = (by_cost.get(account_id) or {}).get("ResultsByTime") or []
+            usage_periods = (by_usage.get(account_id) or {}).get("ResultsByTime") or []
+            credit_periods = (by_credit.get(account_id) or {}).get("ResultsByTime") or []
+            rt_periods = (by_rt.get(account_id) or {}).get("ResultsByTime") or []
+            usage_map = _period_service_amount_map(
+                _find_matching_period(usage_periods, period), display_metric
+            )
+            credit_map = _period_service_amount_map(
+                _find_matching_period(credit_periods, period), display_metric
+            )
+            per_maps.append((usage_map, credit_map, green_style, red_style, label))
+            matched_rt = _find_matching_period(rt_periods, period)
+            p_rt = rollup_record_type_totals([matched_rt], display_metric)
+            for key, amount in p_rt.items():
+                rt_sum[key] = rt_sum.get(key, 0.0) + amount
+            usage_rt = p_rt.get("Usage", 0.0)
+            cred_rt = p_rt.get("Credit", 0.0) + p_rt.get("Refund", 0.0)
+            month_slices.append((usage_rt, cred_rt, green_style, red_style, label))
+            net += _period_metric_total(
+                _find_matching_period(cost_periods, period), display_metric
+            )
+
+        service_names: set[str] = set()
+        for usage_map, credit_map, _green, _red, _label in per_maps:
+            service_names |= set(usage_map) | set(credit_map)
+        service_account_slices = {
+            name: [
+                (
+                    usage_map.get(name, 0.0),
+                    credit_map.get(name, 0.0),
+                    green_style,
+                    red_style,
+                    label,
+                )
+                for usage_map, credit_map, green_style, red_style, label in per_maps
+            ]
+            for name in service_names
+        }
+        merged_usage = _service_maps_to_period(
+            period, [usage_map for usage_map, _, _, _, _ in per_maps], display_metric
+        )
+        merged_credit = _service_maps_to_period(
+            period, [credit_map for _, credit_map, _, _, _ in per_maps], display_metric
+        )
+        console.print(
+            create_service_record_type_split_table(
+                merged_usage,
+                merged_credit,
+                console.width,
+                top,
+                show_all,
+                granularity,
+                display_metric,
+                record_type_for_period=rt_sum,
+                verbose=verbose,
+                cost_filter_min=cost_filter_min,
+                account_label="all accounts",
+                service_account_slices=service_account_slices,
+            )
+        )
+
+        usage_rt = rt_sum.get("Usage", 0.0)
+        cred_rt = rt_sum.get("Credit", 0.0) + rt_sum.get("Refund", 0.0)
+        period_start = period["TimePeriod"]["Start"]
+        incomplete = should_show_in_progress(period_start, granularity)
+        grand_total += net
+        grand_usage += usage_rt
+        grand_cred += cred_rt
+        monthly_totals.append(
+            (
+                format_date_period(period_start, granularity),
+                net,
+                incomplete,
+                usage_rt,
+                cred_rt,
+            )
+        )
+        account_bars.append(month_slices)
+
+    summary_caption = (
+        "[dim]Net = sum of net SERVICE lines across accounts. "
+        "Usage / Credits = Cost Explorer RECORD_TYPE (Billing MTD). "
+        "Each month bar stacks every account's green and red.[/dim]"
+    )
+    console.print(
+        build_monthly_summary_table(
+            monthly_totals,
+            grand_total,
+            grand_usage,
+            grand_cred,
+            console.width,
+            verbose,
+            summary_caption if verbose else "",
+            title="Monthly Summary · all accounts",
+            account_bars=account_bars,
+            color_legend=color_legend,
+        )
+    )
+
+
 def analyze_costs_simple(
     start_date: str,
     end_date: str,
@@ -1407,12 +1878,13 @@ def analyze_costs_simple(
         )
     )
 
-    # Get cost data from AWS Cost Explorer using SERVICE grouping for simple view
+    # Group by linked account first so one set of calls can be split per account.
+    # A single visible account still renders the same report as before.
     cost_data = get_cost_data(
         start_date,
         end_date,
         service,
-        "SERVICE",
+        ["LINKED_ACCOUNT", "SERVICE"],
         granularity,
         region,
         ce_api_dump=ce_api_dump,
@@ -1422,7 +1894,7 @@ def analyze_costs_simple(
         start_date,
         end_date,
         service,
-        "SERVICE",
+        ["LINKED_ACCOUNT", "SERVICE"],
         granularity,
         region,
         record_type_values=["Usage"],
@@ -1433,7 +1905,7 @@ def analyze_costs_simple(
         start_date,
         end_date,
         service,
-        "SERVICE",
+        ["LINKED_ACCOUNT", "SERVICE"],
         granularity,
         region,
         record_type_values=["Credit", "Refund"],
@@ -1467,14 +1939,14 @@ def analyze_costs_simple(
         start_date,
         end_date,
         service,
-        "RECORD_TYPE",
+        ["LINKED_ACCOUNT", "RECORD_TYPE"],
         granularity,
         region,
         ce_api_dump=ce_api_dump,
         ce_api_label="simple:record_type",
     )
-    rt_by_type = rollup_record_type_totals(rt_payload["ResultsByTime"], display_metric)
-    rt_periods_list = rt_payload.get("ResultsByTime", [])
+    family_rt = collapse_linked_account_groups(rt_payload)
+    rt_by_type = rollup_record_type_totals(family_rt["ResultsByTime"], display_metric)
 
     cr_svc: dict[str, float] = {}
     cr_uty: dict[str, float] = {}
@@ -1499,133 +1971,121 @@ def analyze_costs_simple(
                 "(RECORD_TYPE=Credit).[/dim]"
             )
 
-    net_roll, charges_roll, credits_roll = rollup_net_charges_credits(
-        cost_data["ResultsByTime"], display_metric
-    )
-    console.print(
-        "[dim]Rollup (by SERVICE rows):[/dim] "
-        f"net {_rich_usd_positive_red_negative_green(net_roll)} "
-        f"[dim]• gross charges[/dim] [red]{_format_net_usd(charges_roll)}[/red] "
-        f"[dim]• credits/refunds[/dim] [green]{_format_net_usd(credits_roll)}[/green]"
-    )
-    rt_parts = []
-    for key in ("Usage", "Credit", "Refund", "Tax", "Distributor Discount"):
-        if key in rt_by_type and abs(rt_by_type[key]) >= 0.005:
-            rt_parts.append(f"{key} {_rich_usd_record_type_row(key, rt_by_type[key])}")
-    if rt_parts:
+    by_cost = split_by_linked_account(cost_data)
+    by_usage = split_by_linked_account(usage_svc_data)
+    by_credit = split_by_linked_account(credit_svc_data)
+    by_rt = split_by_linked_account(rt_payload)
+    account_ids = _account_ids_in_order(by_cost, by_usage, by_credit, by_rt)
+    if not account_ids:
+        by_cost = {"": cost_data}
+        by_usage = {"": usage_svc_data}
+        by_credit = {"": credit_svc_data}
+        by_rt = {"": family_rt}
+        account_ids = [""]
+
+    def _usage_sort_key(account_id: str) -> tuple[float, str]:
+        payload = by_usage.get(account_id) or {"ResultsByTime": []}
+        return (-_payload_metric_sum(payload, display_metric), account_id)
+
+    account_ids.sort(key=_usage_sort_key)
+    multi = len(account_ids) > 1 and all(account_ids)
+    names = lookup_organization_account_names(account_ids) if multi else {}
+
+    present_kwargs = {
+        "cost_data": cost_data,
+        "usage_svc_data": usage_svc_data,
+        "credit_svc_data": credit_svc_data,
+        "rt_payload": family_rt,
+        "display_metric": display_metric,
+        "start_date": start_date,
+        "end_date": end_date,
+        "top": top,
+        "show_all": show_all,
+        "granularity": granularity,
+        "verbose": verbose,
+        "cost_filter_min": cost_filter_min,
+        "out_summary": out_summary,
+        "print_credits": True,
+        "print_table_note": True,
+    }
+
+    slices: list[AccountGrandSlice] = []
+    if not multi:
+        aid = account_ids[0]
+        present_kwargs["cost_data"] = by_cost.get(aid) or {"ResultsByTime": []}
+        present_kwargs["usage_svc_data"] = by_usage.get(aid) or {"ResultsByTime": []}
+        present_kwargs["credit_svc_data"] = by_credit.get(aid) or {"ResultsByTime": []}
+        present_kwargs["rt_payload"] = by_rt.get(aid) or family_rt
+        _present_simple_account(console, **present_kwargs)
+    else:
+        swatches = []
+        for index, aid in enumerate(account_ids):
+            green_style, red_style = account_color_pair(index)
+            label = format_linked_account_label(aid, names)
+            swatches.append(f"[{green_style}]█[/][{red_style}]█[/] {escape(label)}")
+        console.print("[bold]Accounts included:[/bold] " + " · ".join(swatches))
+        color_legend = "[dim]Accounts: " + " · ".join(swatches) + ".[/dim]"
         console.print(
-            '[dim]RECORD_TYPE (Billing home / CE "Usage vs credits" style): '
-            + " • ".join(rt_parts)
-            + "[/dim]"
+            "[dim]Each account below is its own report. Its service and month bars use that "
+            "account's green and red. The all-accounts tables stack those colors on each "
+            "service and each month.[/dim]"
         )
-    console.print(
-        "[dim]Monthly service tables use RECORD_TYPE filters (Usage vs Credit+Refund per service) "
-        "so column totals align with Usage / Credits in the summary.[/dim]"
-    )
-    print_amazon_credits_section(
-        console, start_date, end_date, out_summary=out_summary
-    )
-
-    # Display costs for each month
-    grand_total = 0.0
-    grand_usage_rt = 0.0
-    grand_cred_rt = 0.0
-    monthly_totals = []
-
-    cost_periods = cost_data["ResultsByTime"]
-    usage_periods = usage_svc_data.get("ResultsByTime", [])
-    credit_periods = credit_svc_data.get("ResultsByTime", [])
-    for i, period in enumerate(cost_periods):
-        monthly_total = _period_metric_total(period, display_metric)
-
-        p_rt = (
-            rollup_record_type_totals([rt_periods_list[i]], display_metric)
-            if i < len(rt_periods_list)
-            else {}
+        console.print(
+            "[dim]Monthly service tables use RECORD_TYPE filters (Usage vs Credit+Refund per "
+            "service) so column totals align with Usage / Credits in the summary.[/dim]"
         )
-        usage_rt = p_rt.get("Usage", 0.0)
-        cred_rt = p_rt.get("Credit", 0.0) + p_rt.get("Refund", 0.0)
-
-        pu = _find_matching_period(usage_periods, period)
-        pc = _find_matching_period(credit_periods, period)
-        table = create_service_record_type_split_table(
-            pu,
-            pc,
-            console.width,
+        print_amazon_credits_section(console, start_date, end_date, out_summary=out_summary)
+        present_kwargs["print_credits"] = False
+        present_kwargs["print_table_note"] = False
+        present_kwargs["out_summary"] = None
+        for index, aid in enumerate(account_ids):
+            green_style, red_style = account_color_pair(index)
+            label = format_linked_account_label(aid, names)
+            console.print()
+            console.print(
+                Rule(
+                    f"[{green_style}]█[/][{red_style}]█[/] [bold]{escape(label)}[/bold]"
+                )
+            )
+            present_kwargs["cost_data"] = by_cost.get(aid) or {"ResultsByTime": []}
+            present_kwargs["usage_svc_data"] = by_usage.get(aid) or {"ResultsByTime": []}
+            present_kwargs["credit_svc_data"] = by_credit.get(aid) or {"ResultsByTime": []}
+            present_kwargs["rt_payload"] = by_rt.get(aid) or {"ResultsByTime": []}
+            present_kwargs["account_label"] = label
+            present_kwargs["green_style"] = green_style
+            present_kwargs["red_style"] = red_style
+            net, usage_rt, cred_rt = _present_simple_account(console, **present_kwargs)
+            slices.append(
+                AccountGrandSlice(
+                    account_id=aid,
+                    label=label,
+                    net=net,
+                    usage=usage_rt,
+                    credit=cred_rt,
+                    green_style=green_style,
+                    red_style=red_style,
+                )
+            )
+        _print_combined_multi_account_tables(
+            console,
+            account_ids,
+            by_cost,
+            by_usage,
+            by_credit,
+            by_rt,
+            display_metric,
             top,
             show_all,
             granularity,
-            display_metric,
-            record_type_for_period=p_rt,
-            verbose=verbose,
-            cost_filter_min=cost_filter_min,
-        )
-        console.print(table)
-
-        period_start = period["TimePeriod"]["Start"]
-        month_name = format_date_period(period_start, granularity)
-
-        incomplete = should_show_in_progress(period_start, granularity)
-        grand_total += monthly_total
-        grand_usage_rt += usage_rt
-        grand_cred_rt += cred_rt
-        monthly_totals.append((month_name, monthly_total, incomplete, usage_rt, cred_rt))
-
-    # Display summary table
-    summary_caption = (
-        "[dim]Net = sum of net SERVICE lines (usage and credits merged per service). "
-        "Usage / Credits = Cost Explorer RECORD_TYPE (Billing MTD). "
-        "Monthly service tables above match these columns (gross per service). "
-        "Bar length scales to the largest month or grand total; "
-        "[green]green[/green] = usage covered by credits; [red]red[/red] = out-of-pocket.[/dim]"
-    )
-    console.print(
-        build_monthly_summary_table(
-            monthly_totals,
-            grand_total,
-            grand_usage_rt,
-            grand_cred_rt,
-            console.width,
             verbose,
-            summary_caption if verbose else "",
+            cost_filter_min,
+            color_legend,
+            [format_linked_account_label(aid, names) for aid in account_ids],
         )
-    )
-
-    # Display cost breakdown insights (share of RECORD_TYPE Usage by service)
-    u_rt = float(rt_by_type.get("Usage", 0.0))
-    item_usage: dict[str, float] = {}
-    for period in usage_periods:
-        for group in period.get("Groups", []):
-            item_name = group["Keys"][0]
-            amount = _metric_amount(group, display_metric)
-            item_usage[item_name] = item_usage.get(item_name, 0.0) + amount
-
-    insight_denom = u_rt if u_rt > 0.01 else max(sum(item_usage.values()), 0.01)
-    sorted_pos = sorted(
-        [(k, v) for k, v in item_usage.items() if v > 0.01],
-        key=lambda x: x[1],
-        reverse=True,
-    )
-    top_items = sorted_pos[:5]
-
-    if insight_denom > 0.01 and top_items:
-        console.print("\n[bold]Cost Breakdown Insights:[/bold]")
-        denom_s = _format_net_usd(insight_denom)
+        console.print()
         console.print(
-            f"[dim]Percentages are of RECORD_TYPE Usage over the range (~{denom_s}).[/dim]"
+            build_accounts_grand_total_table(slices, console.width, start_date, end_date)
         )
-
-        pct_basis = "RECORD_TYPE Usage"
-        for item_name, amount in top_items:
-            percentage = (amount / insight_denom) * 100
-            console.print(
-                f"• [cyan]{item_name}[/cyan]: [red]${amount:.2f}[/red] "
-                f"([bold]{percentage:.1f}%[/bold] of {pct_basis})"
-            )
-
-            tip = get_cost_reduction_tip(item_name)
-            if tip:
-                console.print(f"  [yellow]Tip:[/yellow] {tip}")
 
     if reconcile and verbose:
         print_ce_reconciliation(
@@ -1641,5 +2101,16 @@ def analyze_costs_simple(
 
     if out_summary is not None:
         _fill_json_out_summary(
-            out_summary, start_date, end_date, display_metric, rt_payload, cr_svc, cr_uty
+            out_summary, start_date, end_date, display_metric, family_rt, cr_svc, cr_uty
         )
+        if slices:
+            out_summary["linked_accounts"] = [
+                {
+                    "account_id": sl.account_id,
+                    "label": sl.label,
+                    "net": sl.net,
+                    "usage": sl.usage,
+                    "credits": sl.credit,
+                }
+                for sl in slices
+            ]
