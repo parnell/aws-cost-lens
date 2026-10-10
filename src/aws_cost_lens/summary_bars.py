@@ -95,12 +95,14 @@ def _hover_url(*parts: str) -> str:
 
 
 def _account_section_hover_url(label: str, usage: float, credit: float) -> str | None:
-    """Tooltip for one account's bar section: account, and usage + credits."""
+    """Tooltip for one account's bar section: account, usage, credits, and total."""
     if not label.strip():
         return None
     return _hover_url(
         f"account:{label}",
-        f"cost (usage and credits):{_format_net_usd(usage + credit)}",
+        f"usage:{_format_net_usd(usage)}",
+        f"credits:{_format_net_usd(credit)}",
+        f"total:{_format_net_usd(usage + credit)}",
     )
 
 
@@ -224,8 +226,8 @@ def _service_rec_coverage_bar(
     length: **green** = usage covered by credits; **red** = out-of-pocket
     (``max(0, usage + credit)``). ``green_style`` / ``red_style`` pick the shades.
 
-    When ``account_label`` is set, holding Option on the bar shows that account and the
-    row's cost (usage + credits).
+    When ``account_label`` is set, holding Option on the bar shows that account's
+    usage, credits, and total.
     """
     near = 0.005
     u = float(usage)
@@ -304,8 +306,8 @@ def _coverage_styled_parts(
 ) -> list[tuple[float, str, str | None]]:
     """Dollar segments: green (covered or credit-only), then red (out-of-pocket).
 
-    Each segment carries the same Option-hover link: this account and its cost
-    (usage + credits).
+    Each segment carries the same Option-hover link: this account's usage, credits,
+    and total.
     """
     near = 0.005
     u = float(usage)
@@ -421,7 +423,7 @@ def multi_account_coverage_bar(
 
     ``slices`` entries are ``(usage, credit, green_style, red_style)`` in display order.
     A fifth field, when present, is the account label. Holding Option on that account's
-    green or red section shows the account and its cost (usage + credits).
+    green or red section shows the account's usage, credits, and total.
     """
     parts: list[tuple[float, str, str | None]] = []
     for item in slices:
@@ -451,7 +453,7 @@ def build_monthly_summary_table(
     When ``account_bars`` is set, each entry lines up with ``monthly_totals`` and is a list of
     ``(usage, credit, green_style, red_style)`` per linked account, optionally with that
     account's label. Month bars and the grand total bar then stack those account colors.
-    Holding Option on a section shows the account and its cost (usage + credits).
+    Holding Option on a section shows that account's usage, credits, and total.
 
     ``account_label`` is the single account for a non-stacked bar.
     """
@@ -613,8 +615,7 @@ def build_accounts_grand_total_table(
         "[dim]Accounts included: "
         f"{legend}. Each account has its own green (usage covered by credits) and red "
         "(out-of-pocket). The grand total bar stacks those colors. "
-        "Hold Option on a bar section to see that account and its cost "
-        "(usage and credits).[/dim]"
+        "Hold Option on a bar section to see that account's usage, credits, and total.[/dim]"
     )
     return table
 

@@ -132,7 +132,7 @@ def test_grand_total_bar_stacks_each_accounts_colors():
 
 
 def test_bar_section_hover_names_account_and_cost():
-    """Option-hover (OSC 8) on a section: that account and usage + credits."""
+    """Option-hover (OSC 8) on a section: that account's usage, credits, and total."""
     bar = multi_account_coverage_bar(
         [
             (100.0, -40.0, "green", "red", "prod (111111111111)"),
@@ -142,8 +142,8 @@ def test_bar_section_hover_names_account_and_cost():
         125.0,
     )
     links = [_span_link(span.style) for span in bar.spans]
-    prod = "u:account:prod-(111111111111),cost-(usage-and-credits):$60.00"
-    dev = "u:account:dev-(222222222222),cost-(usage-and-credits):$25.00"
+    prod = "u:account:prod-(111111111111),usage:$100.00,credits:$-40.00,total:$60.00"
+    dev = "u:account:dev-(222222222222),usage:$25.00,credits:$0.00,total:$25.00"
     assert links[0] == prod
     assert links[1] == prod
     assert links[-1] == dev
@@ -236,8 +236,8 @@ def test_accounts_grand_total_table_names_accounts_and_total():
     assert "green" in colors
     assert "bright_red" in colors
     links = [_span_link(span.style) for span in grand_bar.spans]
-    assert "u:account:prod-(111111111111),cost-(usage-and-credits):$60.00" in links
-    assert "u:account:dev-(222222222222),cost-(usage-and-credits):$25.00" in links
+    assert "u:account:prod-(111111111111),usage:$100.00,credits:$-40.00,total:$60.00" in links
+    assert "u:account:dev-(222222222222),usage:$25.00,credits:$0.00,total:$25.00" in links
     assert "Hold Option" in text
 
 
@@ -312,8 +312,8 @@ def test_simple_report_lists_each_account_then_grand_total():
     assert "GRAND TOTAL" in text
     assert "Amazon EC2" in text
     assert "Amazon S3" in text
-    assert "u:account:prod-(111111111111),cost-(usage-and-credits):$60.00" in text
-    assert "u:account:dev-(222222222222),cost-(usage-and-credits):$25.00" in text
+    assert "u:account:prod-(111111111111),usage:$100.00,credits:$-40.00,total:$60.00" in text
+    assert "u:account:dev-(222222222222),usage:$25.00,credits:$0.00,total:$25.00" in text
 
 
 def test_simple_report_single_account_skips_cross_account_total():

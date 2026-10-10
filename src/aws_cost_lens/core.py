@@ -1718,8 +1718,8 @@ def _print_combined_multi_account_tables(
     console.print(Rule("[bold]All accounts[/bold]"))
     console.print(
         "[dim]Each service and each month stacks every account's green (credits cover usage) "
-        "and red (out-of-pocket). Hold Option on a bar section to see that account and its "
-        "cost (usage and credits).[/dim]"
+        "and red (out-of-pocket). Hold Option on a bar section to see that account's "
+        "usage, credits, and total.[/dim]"
     )
     if color_legend:
         console.print(color_legend)
