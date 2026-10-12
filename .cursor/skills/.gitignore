@@ -1,0 +1,6 @@
+# Ignore files at the skills root, allows symlinking of private skills
+# Subdirectories are normal public skills and stay committable.
+/*
+!/*/
+!.gitignore
+!README.md
