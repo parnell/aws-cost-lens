@@ -36,6 +36,7 @@ class AccountGrandSlice(NamedTuple):
     credit: float
     green_style: str
     red_style: str
+    bedrock_net: float = 0.0
 
 
 def account_color_pair(index: int) -> tuple[str, str]:
@@ -540,6 +541,7 @@ def build_accounts_grand_total_table(
     console_width: int,
     start_date: str,
     end_date: str,
+    separate_bedrock: bool = False,
 ) -> Table:
     """
     Cross-account grand total. Each account row uses that account's green and red; the
@@ -557,11 +559,14 @@ def build_accounts_grand_total_table(
     table.add_column("Net", justify="right")
     table.add_column("Usage", justify="right")
     table.add_column("Credits", justify="right")
+    if separate_bedrock:
+        table.add_column("Bedrock net", justify="right")
     table.add_column("Bar (each account's green = credits cover · its red = you pay)", ratio=1)
 
     grand_usage = sum(account.usage for account in accounts)
     grand_cred = sum(account.credit for account in accounts)
     grand_net = sum(account.net for account in accounts)
+    grand_bedrock = sum(account.bedrock_net for account in accounts)
     max_mag = sum(_service_rec_row_magnitude(account.usage, account.credit) for account in accounts)
     if max_mag < 0.005:
         max_mag = 1.0
@@ -578,13 +583,16 @@ def build_accounts_grand_total_table(
             red_style=account.red_style,
             account_label=account.label,
         )
-        table.add_row(
+        row = [
             escape(account.label),
             _rich_usd_signed_bold(account.net),
             usage_s,
             cred_s,
-            bar,
-        )
+        ]
+        if separate_bedrock:
+            row.append(_rich_usd_signed_bold(account.bedrock_net))
+        row.append(bar)
+        table.add_row(*row)
 
     grand_bar = multi_account_coverage_bar(
         [
@@ -600,13 +608,16 @@ def build_accounts_grand_total_table(
         console_width,
         max_mag,
     )
-    table.add_row(
+    total_row = [
         "[bold]GRAND TOTAL[/bold]",
         _rich_usd_signed_bold(grand_net),
         f"[bold]{_format_net_usd(grand_usage)}[/bold]",
         f"[bold]{_format_net_usd(grand_cred)}[/bold]",
-        grand_bar,
-    )
+    ]
+    if separate_bedrock:
+        total_row.append(_rich_usd_signed_bold(grand_bedrock))
+    total_row.append(grand_bar)
+    table.add_row(*total_row)
     legend = " · ".join(
         f"[{account.green_style}]█[/][{account.red_style}]█[/] {escape(account.label)}"
         for account in accounts
@@ -615,12 +626,120 @@ def build_accounts_grand_total_table(
         "[dim]Accounts included: "
         f"{legend}. Each account has its own green (usage covered by credits) and red "
         "(out-of-pocket). The grand total bar stacks those colors. "
-        "Hold Option on a bar section to see that account's usage, credits, and total.[/dim]"
+        "Hold Option on a bar section to see that account's usage, credits, and total."
+        + (
+            " Bedrock net is services whose name contains Bedrock."
+            if separate_bedrock
+            else ""
+        )
+        + "[/dim]"
     )
     return table
 
 
 OTHER_SERVICES_ROW_LABEL = "All other services"
+BEDROCK_SUBTOTAL_LABEL = "Bedrock (billable)"
+
+_BEDROCK_SPLIT_CAPTION = (
+    "[dim]Bedrock is every Cost Explorer service whose name contains \"Bedrock\" "
+    "(Amazon Bedrock, AgentCore, and marketplace editions such as "
+    "\"Claude (Amazon Bedrock Edition)\"). "
+    "Bedrock usage is the gross; Bedrock net is usage plus credits — bill whichever "
+    "the client agreement uses. Other net is every remaining service. "
+    "Tax and other charges Cost Explorer does not assign to a service stay in the "
+    "monthly summary.[/dim]"
+)
+
+
+def is_bedrock_service(name: str) -> bool:
+    """True when this Cost Explorer service name is a Bedrock charge.
+
+    Matches Amazon Bedrock itself and related names that still say Bedrock:
+    AgentCore, and marketplace model editions such as
+    ``Claude 3 Haiku (Amazon Bedrock Edition)``.
+    """
+    return "bedrock" in name.casefold()
+
+
+def partition_bedrock_maps(
+    usage_map: dict[str, float],
+    credit_map: dict[str, float],
+) -> tuple[float, float, float, float]:
+    """Split service amounts into Bedrock vs everything else.
+
+    Returns ``(bedrock_usage, bedrock_credit, other_usage, other_credit)``.
+    Credit totals stay signed the way Cost Explorer sends them (negative).
+    """
+    bedrock_usage = 0.0
+    bedrock_credit = 0.0
+    other_usage = 0.0
+    other_credit = 0.0
+    for name in set(usage_map) | set(credit_map):
+        usage = float(usage_map.get(name, 0.0))
+        credit = float(credit_map.get(name, 0.0))
+        if is_bedrock_service(name):
+            bedrock_usage += usage
+            bedrock_credit += credit
+        else:
+            other_usage += usage
+            other_credit += credit
+    return bedrock_usage, bedrock_credit, other_usage, other_credit
+
+
+def build_bedrock_split_table(
+    months: list[tuple[str, bool, float, float, float, float]],
+    *,
+    title: str = "Bedrock vs other",
+    caption: str = _BEDROCK_SPLIT_CAPTION,
+) -> Table:
+    """Monthly Bedrock vs everything else.
+
+    Each entry is ``(month, incomplete, bedrock_usage, bedrock_credit, other_usage, other_credit)``.
+    Bedrock net and Other net are usage plus credits.
+    """
+    table = Table(title=title, expand=True)
+    table.add_column("Month", style="cyan")
+    table.add_column("Bedrock usage", justify="right", style="red")
+    table.add_column("Bedrock credits", justify="right", style="green")
+    table.add_column("Bedrock net", justify="right")
+    table.add_column("Other net", justify="right")
+
+    totals = [0.0, 0.0, 0.0, 0.0]
+    rendered: list[tuple[str, float, float, float, float]] = []
+    for month, incomplete, bedrock_usage, bedrock_credit, other_usage, other_credit in months:
+        label = f"{month} [dim](MTD)[/dim]" if incomplete else month
+        rendered.append((label, bedrock_usage, bedrock_credit, other_usage, other_credit))
+        totals[0] += bedrock_usage
+        totals[1] += bedrock_credit
+        totals[2] += other_usage
+        totals[3] += other_credit
+
+    def _add(
+        label: str,
+        bedrock_usage: float,
+        bedrock_credit: float,
+        other_usage: float,
+        other_credit: float,
+        *,
+        bold: bool,
+    ) -> None:
+        usage_s = _format_net_usd(bedrock_usage)
+        credit_s = _format_net_usd(bedrock_credit)
+        bedrock_net = _rich_usd_signed_bold(bedrock_usage + bedrock_credit)
+        other_net = _rich_usd_signed_bold(other_usage + other_credit)
+        if bold:
+            label = f"[bold]{label}[/bold]"
+            usage_s = f"[bold]{usage_s}[/bold]"
+            credit_s = f"[bold]{credit_s}[/bold]"
+        table.add_row(label, usage_s, credit_s, bedrock_net, other_net)
+
+    _add("GRAND TOTAL", *totals, bold=True)
+    for label, bedrock_usage, bedrock_credit, other_usage, other_credit in rendered:
+        _add(label, bedrock_usage, bedrock_credit, other_usage, other_credit, bold=False)
+
+    if caption:
+        table.caption = caption
+    return table
 
 
 def create_service_record_type_split_table(
@@ -638,6 +757,7 @@ def create_service_record_type_split_table(
     green_style: str = "green",
     red_style: str = "red",
     service_account_slices: dict[str, list[CoverageSlice]] | None = None,
+    separate_bedrock: bool = False,
 ) -> Table:
     """
     One monthly table: **Usage** from ``RECORD_TYPE=Usage`` by SERVICE; **Credits** from
@@ -648,6 +768,10 @@ def create_service_record_type_split_table(
     When ``cost_filter_min`` > 0, each per-service gross weight ``max(usage, |credits|)`` is
     compared to that threshold: rows at or above it stay separate (subject to ``top``); the rest
     are summed into one **All other services** row so table totals stay complete.
+
+    When ``separate_bedrock`` is set, services whose name contains Bedrock are listed first
+    with a **Bedrock (billable)** subtotal. Those rows are exempt from ``top`` and the cost
+    filter so a client-billable line is not folded into All other services.
     """
     from .core import (  # late import: this module is imported by core at package load
         _period_service_amount_map,
@@ -688,44 +812,70 @@ def create_service_record_type_split_table(
     def _row_eligible_for_display(u: float, c: float) -> bool:
         return show_all or abs(u) >= 0.01 or abs(c) >= 0.01
 
-    rows.sort(key=_row_weight, reverse=True)
+    def _limit_service_rows(
+        source: list[tuple[str, float, float, list[CoverageSlice] | None]],
+    ) -> tuple[list[tuple[str, float, float, list[CoverageSlice] | None]], str]:
+        limited = sorted(source, key=_row_weight, reverse=True)
+        cf = float(cost_filter_min) if cost_filter_min and cost_filter_min > 0 else 0.0
+        if cf > 0.0:
+            major: list[tuple[str, float, float, list[CoverageSlice] | None]] = []
+            minor: list[tuple[str, float, float, list[CoverageSlice] | None]] = []
+            for name, u, c, slices in limited:
+                if not _row_eligible_for_display(u, c):
+                    continue
+                if _row_weight((name, u, c, slices)) >= cf:
+                    major.append((name, u, c, slices))
+                else:
+                    minor.append((name, u, c, slices))
+            if top > 0:
+                shown_major = major[:top]
+                overflow_major = major[top:]
+            else:
+                shown_major = major
+                overflow_major = []
+            into_other = minor + overflow_major
+            agg_u = sum(x[1] for x in into_other)
+            agg_c = sum(x[2] for x in into_other)
+            limited = list(shown_major)
+            if into_other:
+                slice_groups = [slices for _, _, _, slices in into_other if slices]
+                agg_slices = _sum_aligned_slices(slice_groups) if slice_groups else None
+                limited.append((OTHER_SERVICES_ROW_LABEL, agg_u, agg_c, agg_slices))
+            caption = (
+                f"[dim]Per-service lines shown when max(Usage, |Credits|) ≥ {_format_net_usd(cf)}; "
+                f"smaller lines are combined into '{OTHER_SERVICES_ROW_LABEL}'.[/dim]"
+            )
+            return limited, caption
+        if top > 0:
+            limited = limited[:top]
+        return limited, ""
 
     total_count = len(rows)
     non_zero_count = sum(1 for _, u, c, _slices in rows if abs(u) >= 0.01 or abs(c) >= 0.01)
     zero_count = total_count - non_zero_count
 
-    cf = float(cost_filter_min) if cost_filter_min and cost_filter_min > 0 else 0.0
-    filter_caption = ""
-    if cf > 0.0:
-        major: list[tuple[str, float, float, list[CoverageSlice] | None]] = []
-        minor: list[tuple[str, float, float, list[CoverageSlice] | None]] = []
-        for name, u, c, slices in rows:
-            if not _row_eligible_for_display(u, c):
-                continue
-            if _row_weight((name, u, c, slices)) >= cf:
-                major.append((name, u, c, slices))
-            else:
-                minor.append((name, u, c, slices))
-        if top > 0:
-            shown_major = major[:top]
-            overflow_major = major[top:]
-        else:
-            shown_major = major
-            overflow_major = []
-        into_other = minor + overflow_major
-        agg_u = sum(x[1] for x in into_other)
-        agg_c = sum(x[2] for x in into_other)
-        rows = list(shown_major)
-        if into_other:
-            slice_groups = [slices for _, _, _, slices in into_other if slices]
-            agg_slices = _sum_aligned_slices(slice_groups) if slice_groups else None
-            rows.append((OTHER_SERVICES_ROW_LABEL, agg_u, agg_c, agg_slices))
-        filter_caption = (
-            f"[dim]Per-service lines shown when max(Usage, |Credits|) ≥ {_format_net_usd(cf)}; "
-            f"smaller lines are combined into '{OTHER_SERVICES_ROW_LABEL}'.[/dim]"
-        )
-    elif top > 0:
-        rows = rows[:top]
+    shown_bedrock: list[tuple[str, float, float, list[CoverageSlice] | None]] = []
+    if separate_bedrock:
+        bedrock_rows = [row for row in rows if is_bedrock_service(row[0])]
+        other_rows = [row for row in rows if not is_bedrock_service(row[0])]
+        shown_bedrock = [
+            row
+            for row in sorted(bedrock_rows, key=_row_weight, reverse=True)
+            if _row_eligible_for_display(row[1], row[2])
+        ]
+        rows, filter_caption = _limit_service_rows(other_rows)
+        if shown_bedrock:
+            sub_u = sum(row[1] for row in shown_bedrock)
+            sub_c = sum(row[2] for row in shown_bedrock)
+            slice_groups = [row[3] for row in shown_bedrock if row[3]]
+            sub_slices = _sum_aligned_slices(slice_groups) if slice_groups else None
+            rows = [
+                *shown_bedrock,
+                (BEDROCK_SUBTOTAL_LABEL, sub_u, sub_c, sub_slices),
+                *rows,
+            ]
+    else:
+        rows, filter_caption = _limit_service_rows(rows)
 
     if show_all or zero_count == 0:
         title_core = f"{title_prefix} {period_display} Costs"
@@ -742,6 +892,8 @@ def create_service_record_type_split_table(
         title = title_core
 
     title += " [dim]· by service (RECORD_TYPE Usage / Credits)[/dim]"
+    if shown_bedrock:
+        title += " [dim]· Bedrock listed first[/dim]"
     if account_label:
         title += f" [dim]· {escape(account_label)}[/dim]"
     if filter_caption:
@@ -766,13 +918,18 @@ def create_service_record_type_split_table(
             return _styled_slices_magnitude(slices)
         return _service_rec_row_magnitude(usage, credit)
 
+    kept_labels = {OTHER_SERVICES_ROW_LABEL, BEDROCK_SUBTOTAL_LABEL}
     visible = [
         (n, u, c, slices)
         for n, u, c, slices in rows
-        if show_all or abs(u) >= 0.01 or abs(c) >= 0.01 or n == OTHER_SERVICES_ROW_LABEL
+        if show_all or abs(u) >= 0.01 or abs(c) >= 0.01 or n in kept_labels
     ]
     max_mag = max(
-        (_row_magnitude(u, c, slices) for _, u, c, slices in visible),
+        (
+            _row_magnitude(u, c, slices)
+            for name, u, c, slices in visible
+            if name != BEDROCK_SUBTOTAL_LABEL
+        ),
         default=0.0,
     )
     if max_mag < 0.005:
@@ -783,11 +940,17 @@ def create_service_record_type_split_table(
             not show_all
             and abs(u) < 0.01
             and abs(c) < 0.01
-            and name != OTHER_SERVICES_ROW_LABEL
+            and name not in kept_labels
         ):
             continue
         usage_s = _format_net_usd(u) if u >= 0.005 else "—"
         cred_s = _format_net_usd(c) if c <= -0.005 else "—"
+        if name == BEDROCK_SUBTOTAL_LABEL:
+            name = f"[bold]{name}[/bold]"
+            if usage_s != "—":
+                usage_s = f"[bold]{usage_s}[/bold]"
+            if cred_s != "—":
+                cred_s = f"[bold]{cred_s}[/bold]"
         if slices:
             bar_cell = multi_account_coverage_bar(slices, console_width, max_mag)
         else:

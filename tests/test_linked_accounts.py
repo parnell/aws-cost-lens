@@ -241,6 +241,43 @@ def test_accounts_grand_total_table_names_accounts_and_total():
     assert "Hold Option" in text
 
 
+def test_accounts_grand_total_adds_bedrock_net_column():
+    table = build_accounts_grand_total_table(
+        [
+            AccountGrandSlice(
+                "111111111111",
+                "prod (111111111111)",
+                60,
+                100,
+                -40,
+                "green",
+                "red",
+                bedrock_net=40,
+            ),
+            AccountGrandSlice(
+                "222222222222",
+                "dev (222222222222)",
+                25,
+                25,
+                0,
+                "bright_green",
+                "bright_red",
+                bedrock_net=10,
+            ),
+        ],
+        120,
+        "2024-01-01",
+        "2024-02-01",
+        separate_bedrock=True,
+    )
+    text = _table_text(table)
+    assert "Bedrock net" in text
+    assert "$40.00" in text
+    assert "$10.00" in text
+    assert "$50.00" in text
+    assert "services whose name contains Bedrock" in " ".join(text.split())
+
+
 def _linked_payload(rows: list[tuple[str, str, str]]) -> dict:
     return _payload(*[_group([account, name], amount) for account, name, amount in rows])
 
@@ -356,4 +393,65 @@ def test_simple_report_single_account_skips_cross_account_total():
     assert "Monthly Summary" in text
     assert "Grand total by account" not in text
     assert "Accounts included" not in text
+    assert "Bedrock vs other" not in text
     lookup.assert_not_called()
+
+
+def test_separate_bedrock_lists_small_marketplace_line_and_billable_net():
+    from aws_cost_lens.core import analyze_costs_simple
+
+    payloads = {
+        "simple:service": _linked_payload(
+            [
+                ("111111111111", "Amazon Bedrock", "80"),
+                ("111111111111", "Claude 3 Haiku (Amazon Bedrock Edition)", "10"),
+                ("111111111111", "Amazon EC2", "40"),
+            ]
+        ),
+        "simple:service+record_usage": _linked_payload(
+            [
+                ("111111111111", "Amazon Bedrock", "100"),
+                ("111111111111", "Claude 3 Haiku (Amazon Bedrock Edition)", "10"),
+                ("111111111111", "Amazon EC2", "40"),
+            ]
+        ),
+        "simple:service+record_credit": _linked_payload(
+            [("111111111111", "Amazon Bedrock", "-20")]
+        ),
+        "simple:record_type": _linked_payload(
+            [
+                ("111111111111", "Usage", "150"),
+                ("111111111111", "Credit", "-20"),
+            ]
+        ),
+    }
+
+    def fake_get_cost_data(*args, **kwargs):
+        return payloads[kwargs["ce_api_label"]]
+
+    buf = io.StringIO()
+    console = Console(file=buf, width=140, force_terminal=False, color_system=None, no_color=True)
+    with (
+        patch("aws_cost_lens.core.get_cost_data", side_effect=fake_get_cost_data),
+        patch("aws_cost_lens.core.Console", return_value=console),
+        patch("aws_cost_lens.core.get_account_header_markup", return_value="Account: only"),
+        patch("aws_cost_lens.core.print_amazon_credits_section"),
+        patch("aws_cost_lens.core.should_show_in_progress", return_value=False),
+    ):
+        analyze_costs_simple(
+            "2024-01-01",
+            "2024-02-01",
+            None,
+            metric_preference="unblended",
+            reconcile=False,
+            cost_filter_min=50.0,
+            separate_bedrock=True,
+        )
+
+    text = buf.getvalue()
+    assert "Bedrock vs other" in text
+    assert "Claude 3 Haiku (Amazon Bedrock Edition)" in text
+    assert "Bedrock (billable)" in text
+    assert "$110.00" in text
+    assert "$90.00" in text
+    assert "Amazon EC2" not in text.split("Cost Breakdown Insights")[0]

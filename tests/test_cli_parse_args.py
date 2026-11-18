@@ -64,6 +64,20 @@ def test_parse_args_no_reconcile(monkeypatch):
     assert parse_args().reconcile is False
 
 
+def test_parse_args_separate_bedrock_defaults_off(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["aws-cost-lens"])
+    from aws_cost_lens.cli import parse_args
+
+    assert parse_args().separate_bedrock is False
+
+
+def test_parse_args_separate_bedrock(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["aws-cost-lens", "--separate-bedrock"])
+    from aws_cost_lens.cli import parse_args
+
+    assert parse_args().separate_bedrock is True
+
+
 def test_parse_args_out_json(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["aws-cost-lens", "--out", "json"])
     from aws_cost_lens.cli import parse_args

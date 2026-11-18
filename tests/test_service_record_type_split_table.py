@@ -7,9 +7,13 @@ from rich.console import Console
 
 from aws_cost_lens.core import _find_matching_period
 from aws_cost_lens.summary_bars import (
+    BEDROCK_SUBTOTAL_LABEL,
     OTHER_SERVICES_ROW_LABEL,
     _service_rec_coverage_bar,
+    build_bedrock_split_table,
     create_service_record_type_split_table,
+    is_bedrock_service,
+    partition_bedrock_maps,
 )
 
 
@@ -155,6 +159,112 @@ def test_cost_filter_with_top_sends_overflow_major_into_other():
     assert "XraySvc" not in text
     assert OTHER_SERVICES_ROW_LABEL in text
     assert table.row_count == 2
+
+
+def _svc(name: str, amount: str) -> dict:
+    return {
+        "Keys": [name],
+        "Metrics": {"UnblendedCost": {"Amount": amount, "Unit": "USD"}},
+    }
+
+
+def test_separate_bedrock_keeps_small_bedrock_lines_and_subtotals_them():
+    """A Bedrock line below the cost filter stays listed, with a billable subtotal."""
+    pu, pc = _period(
+        [
+            _svc("Amazon Bedrock", "12.00"),
+            _svc("Claude 3 Haiku (Amazon Bedrock Edition)", "8.00"),
+            _svc("Amazon ECS", "100.00"),
+            _svc("Amazon S3", "5.00"),
+        ],
+        [
+            _svc("Amazon Bedrock", "-2.00"),
+            _svc("Amazon ECS", "-10.00"),
+        ],
+    )
+    with patch("aws_cost_lens.core.should_show_in_progress", return_value=False):
+        table = create_service_record_type_split_table(
+            pu,
+            pc,
+            console_width=100,
+            top=0,
+            show_all=False,
+            granularity="MONTHLY",
+            metric="UnblendedCost",
+            cost_filter_min=50.0,
+            separate_bedrock=True,
+        )
+
+    names = [getattr(cell, "plain", str(cell)) for cell in table.columns[0]._cells]
+    assert names[0] == "Amazon Bedrock"
+    assert names[1] == "Claude 3 Haiku (Amazon Bedrock Edition)"
+    assert BEDROCK_SUBTOTAL_LABEL in names[2]
+    assert "Amazon ECS" in names
+    assert "Amazon S3" not in names
+    assert OTHER_SERVICES_ROW_LABEL in names
+    assert "$20.00" in str(table.columns[1]._cells[2])
+    assert "$-2.00" in str(table.columns[2]._cells[2])
+
+
+def test_without_separate_bedrock_small_bedrock_folds_into_other():
+    pu, pc = _period(
+        [
+            _svc("Amazon Bedrock", "12.00"),
+            _svc("Amazon ECS", "100.00"),
+        ],
+        [],
+    )
+    with patch("aws_cost_lens.core.should_show_in_progress", return_value=False):
+        table = create_service_record_type_split_table(
+            pu,
+            pc,
+            console_width=100,
+            top=0,
+            show_all=False,
+            granularity="MONTHLY",
+            metric="UnblendedCost",
+            cost_filter_min=50.0,
+        )
+    names = [getattr(cell, "plain", str(cell)) for cell in table.columns[0]._cells]
+    assert "Amazon Bedrock" not in names
+    assert OTHER_SERVICES_ROW_LABEL in names
+    assert BEDROCK_SUBTOTAL_LABEL not in names
+
+
+def test_bedrock_split_table_nets_usage_plus_credits():
+    table = build_bedrock_split_table(
+        [
+            ("October 2026", False, 20.0, -2.0, 100.0, -10.0),
+            ("November 2026", True, 5.0, 0.0, 1.0, 0.0),
+        ]
+    )
+    text = _table_text(table)
+    assert "Bedrock vs other" in text
+    assert "Bedrock net" in text
+    assert "$23.00" in text
+    assert "$91.00" in text
+    assert "(MTD)" in text
+    assert "client agreement" in text
+
+
+def test_is_bedrock_service_matches_marketplace_editions_only():
+    assert is_bedrock_service("Amazon Bedrock")
+    assert is_bedrock_service("Amazon Bedrock AgentCore")
+    assert is_bedrock_service("Claude 3 Haiku (Amazon Bedrock Edition)")
+    assert not is_bedrock_service("Amazon ECS")
+    assert not is_bedrock_service("AWS Marketplace")
+
+
+def test_partition_bedrock_maps_sums_family_and_leaves_the_rest():
+    bedrock_usage, bedrock_credit, other_usage, other_credit = partition_bedrock_maps(
+        {
+            "Amazon Bedrock": 12.0,
+            "Claude 3 Haiku (Amazon Bedrock Edition)": 8.0,
+            "Amazon ECS": 100.0,
+        },
+        {"Amazon Bedrock": -2.0, "Amazon ECS": -10.0},
+    )
+    assert (bedrock_usage, bedrock_credit, other_usage, other_credit) == (20.0, -2.0, 100.0, -10.0)
 
 
 def test_coverage_bar_fully_covered_is_single_color_at_max_scale():

@@ -14,6 +14,8 @@ from aws_cost_lens.core import AWSService
         ("s3", "AmazonS3"),
         ("ec2", "AmazonEC2"),
         ("api-gateway", "AmazonApiGateway"),
+        ("bedrock", "Amazon Bedrock"),
+        ("Amazon Bedrock", "Amazon Bedrock"),
         ("apigateway", "AmazonApiGateway"),
         ("UnknownServiceName", "UnknownServiceName"),
     ],

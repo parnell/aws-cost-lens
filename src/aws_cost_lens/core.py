@@ -31,8 +31,11 @@ from .summary_bars import (
     _split_usage_credit,
     account_color_pair,
     build_accounts_grand_total_table,
+    build_bedrock_split_table,
     build_monthly_summary_table,
     create_service_record_type_split_table,
+    is_bedrock_service,
+    partition_bedrock_maps,
 )
 
 # AWS Cost Explorer limits
@@ -133,14 +136,45 @@ def get_account_header_markup() -> str:
     return f"Account: [cyan]{account_id}[/cyan]"
 
 
+def _cost_period_key(period: dict) -> tuple[str, str]:
+    """Identity for one ``ResultsByTime`` row. Pages repeat a period or continue later days."""
+    window = period.get("TimePeriod") or {}
+    return (window.get("Start") or "", window.get("End") or "")
+
+
 def _merge_cost_and_usage_pages(pages: list[dict]) -> dict:
-    """Merge paginated get_cost_and_usage responses (extra Groups per time period)."""
+    """Merge paginated ``get_cost_and_usage`` responses by ``TimePeriod``.
+
+    Cost Explorer uses one token for two layouts: more ``Groups`` for a period already
+    returned, and later periods on the next page. Matching on the window keeps those
+    later days as their own rows. Index alignment stuffed the next page onto the first
+    page's dates and dropped every day the first response did not already contain.
+    """
     if not pages:
         return {}
-    merged = pages[0]
-    for page in pages[1:]:
-        for i, period in enumerate(page.get("ResultsByTime", [])):
-            merged["ResultsByTime"][i]["Groups"].extend(period.get("Groups", []))
+    merged = {key: value for key, value in pages[0].items() if key != "NextPageToken"}
+    by_period: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for page in pages:
+        for period in page.get("ResultsByTime") or []:
+            key = _cost_period_key(period)
+            existing = by_period.get(key)
+            if existing is None:
+                cloned = {field: value for field, value in period.items() if field != "Groups"}
+                if "Groups" in period:
+                    cloned["Groups"] = list(period.get("Groups") or [])
+                by_period[key] = cloned
+                order.append(key)
+                continue
+            extra_groups = period.get("Groups") or []
+            if extra_groups:
+                existing["Groups"] = list(existing.get("Groups") or [])
+                existing["Groups"].extend(extra_groups)
+            if period.get("Estimated"):
+                existing["Estimated"] = True
+            if not (existing.get("Total") or {}) and period.get("Total"):
+                existing["Total"] = period["Total"]
+    merged["ResultsByTime"] = [by_period[key] for key in order]
     return merged
 
 
@@ -283,6 +317,7 @@ class AWSService(Enum):
     REDSHIFT = ServiceInfo("AmazonRedshift", ["redshift"])
     CLOUDFRONT = ServiceInfo("AmazonCloudFront", ["cloudfront"])
     VPC = ServiceInfo("AmazonVPC", ["vpc"])
+    BEDROCK = ServiceInfo("Amazon Bedrock", ["bedrock"])
 
     @property
     def aws_name(self) -> str:
@@ -898,6 +933,91 @@ def should_show_in_progress(period_date: str, granularity: str = "MONTHLY") -> b
     return False
 
 
+def _usage_type_costs_title(
+    month_display: str,
+    costs: list[tuple[str, str, float]],
+    show_all: bool,
+    suffix: str = "",
+) -> str:
+    """Title for one detailed usage-type table, including the hidden zero-cost count."""
+    total_count = len(costs)
+    non_zero_count = sum(1 for _, _, amount in costs if abs(amount) >= 0.01)
+    zero_count = total_count - non_zero_count
+    if show_all or zero_count == 0:
+        title = f"{month_display} Costs"
+    else:
+        title = (
+            f"{month_display} Costs "
+            f"[dim]• Showing {non_zero_count} of {total_count} items "
+            f"(hidden: {zero_count} zero-cost items)[/dim]"
+        )
+    if suffix:
+        title += f" {suffix}"
+    return title
+
+
+def _print_usage_type_cost_table(
+    console: Console,
+    costs: list[tuple[str, str, float]],
+    title: str,
+    *,
+    top: int,
+    show_all: bool,
+    verbose: bool,
+) -> None:
+    """Print one SERVICE + USAGE_TYPE table. ``top`` truncates after sorting by amount."""
+    table = Table(title=title, expand=True)
+    table.add_column("Service", style="cyan")
+    table.add_column("Usage Type", style="dim")
+    table.add_column("Usage", justify="right", style="red")
+    table.add_column("Credits", justify="right", style="green")
+    table.add_column("Bar (red=paid · green=credits)", ratio=1)
+
+    ordered = sorted(costs, key=lambda x: x[2], reverse=True)
+    if top > 0:
+        ordered = ordered[:top]
+
+    displayed_amts = [c for _, _, c in ordered if show_all or abs(c) >= 0.01]
+    pos_amts = [a for a in displayed_amts if a > 0.01]
+    neg_amts = [a for a in displayed_amts if a < -0.01]
+    max_pos = max(pos_amts, default=0.0)
+    max_neg = max((abs(a) for a in neg_amts), default=0.0)
+
+    for service_name, usage_type, amount in ordered:
+        if abs(amount) < 0.01 and not show_all:
+            continue
+        u, c = _split_usage_credit(amount)
+        usage_s, cred_s = _format_usage_credit_cells(amount)
+        bar_cell = _service_usage_credit_bar(u, c, max_pos, max_neg)
+        table.add_row(service_name, usage_type, usage_s, cred_s, bar_cell)
+
+    if verbose:
+        table.caption = (
+            "Same bar style as SERVICE: [red]red[/red]=paid vs max, "
+            "[green]green[/green]=credits vs max |credit|."
+        )
+    console.print(table)
+
+
+def _bedrock_month_from_signed_costs(
+    month_name: str,
+    incomplete: bool,
+    costs: list[tuple[str, str, float]],
+) -> tuple[str, bool, float, float, float, float]:
+    """Bedrock vs other from detailed lines, where each amount is already a net."""
+    usage_map: dict[str, float] = {}
+    credit_map: dict[str, float] = {}
+    for service_name, _usage_type, amount in costs:
+        if amount > 0:
+            usage_map[service_name] = usage_map.get(service_name, 0.0) + amount
+        elif amount < 0:
+            credit_map[service_name] = credit_map.get(service_name, 0.0) + amount
+    bedrock_usage, bedrock_credit, other_usage, other_credit = partition_bedrock_maps(
+        usage_map, credit_map
+    )
+    return month_name, incomplete, bedrock_usage, bedrock_credit, other_usage, other_credit
+
+
 def analyze_costs_detailed(
     start_date: str,
     end_date: str,
@@ -912,6 +1032,7 @@ def analyze_costs_detailed(
     verbose: bool = False,
     ce_api_dump: list[dict] | None = None,
     out_summary: dict | None = None,
+    separate_bedrock: bool = False,
 ) -> None:
     """Analyze costs with detailed breakdown by SERVICE, USAGE_TYPE, and optionally REGION."""
     console = Console()
@@ -935,6 +1056,11 @@ def analyze_costs_detailed(
             f"{get_account_header_markup()}\n[bold]{title}[/bold]\n{start_date} to {end_date}"
         )
     )
+    if separate_bedrock:
+        console.print(
+            "[dim]Separating Bedrock: services whose name contains Bedrock "
+            "are pulled out so you can bill them to a client.[/dim]"
+        )
 
     # Process each grouping type
     console.print("\n[bold]Analyzing by USAGE_TYPE with SERVICE information[/bold]")
@@ -1029,76 +1155,86 @@ def analyze_costs_detailed(
         console, start_date, end_date, out_summary=out_summary
     )
 
+    bedrock_months: list[tuple[str, bool, float, float, float, float]] = []
+
     # Display costs for each month
     for period in cost_data["ResultsByTime"]:
         month_start = period["TimePeriod"]["Start"]
         month_display = format_date_period(month_start, granularity)
 
-        # Count items
         costs = []
         for group in period["Groups"]:
-            # Extract service and usage type from the keys
             keys = group["Keys"]
             service_name = keys[0]
             usage_type = keys[1]
-
             amount = _metric_amount(group, display_metric)
             costs.append((service_name, usage_type, amount))
 
-        # Calculate displayed vs total count
-        total_count = len(costs)
-        non_zero_count = sum(1 for _, _, amount in costs if abs(amount) >= 0.01)
-        zero_count = total_count - non_zero_count
-
-        # Create title with count information
-        if show_all or zero_count == 0:
-            title = f"{month_display} Costs"
+        if separate_bedrock:
+            bedrock_months.append(
+                _bedrock_month_from_signed_costs(
+                    month_display,
+                    should_show_in_progress(month_start, granularity),
+                    costs,
+                )
+            )
+            bedrock_costs = [row for row in costs if is_bedrock_service(row[0])]
+            other_costs = [row for row in costs if not is_bedrock_service(row[0])]
         else:
-            title = (
-                f"{month_display} Costs "
-                f"[dim]• Showing {non_zero_count} of {total_count} items "
-                f"(hidden: {zero_count} zero-cost items)[/dim]"
+            bedrock_costs = []
+            other_costs = costs
+
+        if bedrock_costs:
+            _print_usage_type_cost_table(
+                console,
+                bedrock_costs,
+                _usage_type_costs_title(
+                    month_display,
+                    bedrock_costs,
+                    show_all,
+                    "[dim]· Bedrock (billable)[/dim]",
+                ),
+                top=0,
+                show_all=show_all,
+                verbose=verbose,
+            )
+            if other_costs:
+                _print_usage_type_cost_table(
+                    console,
+                    other_costs,
+                    _usage_type_costs_title(
+                        month_display,
+                        other_costs,
+                        show_all,
+                        "[dim]· other services[/dim]",
+                    ),
+                    top=top,
+                    show_all=show_all,
+                    verbose=verbose,
+                )
+        else:
+            _print_usage_type_cost_table(
+                console,
+                costs,
+                _usage_type_costs_title(month_display, costs, show_all),
+                top=top,
+                show_all=show_all,
+                verbose=verbose,
             )
 
-        table = Table(title=title, expand=True)
-        table.add_column("Service", style="cyan")
-        table.add_column("Usage Type", style="dim")
-        table.add_column("Usage", justify="right", style="red")
-        table.add_column("Credits", justify="right", style="green")
-        table.add_column("Bar (red=paid · green=credits)", ratio=1)
-
-        # Sort by cost (highest first)
-        costs.sort(key=lambda x: x[2], reverse=True)
-
-        # Apply limit if specified
-        if top > 0:
-            costs = costs[:top]
-
-        displayed_amts = [c for _, _, c in costs if show_all or abs(c) >= 0.01]
-        pos_amts = [a for a in displayed_amts if a > 0.01]
-        neg_amts = [a for a in displayed_amts if a < -0.01]
-        max_pos = max(pos_amts, default=0.0)
-        max_neg = max((abs(a) for a in neg_amts), default=0.0)
-
-        # Add rows
-        for service_name, usage_type, amount in costs:
-            # Skip negligible amounts unless show_all is True (include credits / negatives)
-            if abs(amount) < 0.01 and not show_all:
-                continue
-
-            u, c = _split_usage_credit(amount)
-            usage_s, cred_s = _format_usage_credit_cells(amount)
-            bar_cell = _service_usage_credit_bar(u, c, max_pos, max_neg)
-
-            table.add_row(service_name, usage_type, usage_s, cred_s, bar_cell)
-
-        if verbose:
-            table.caption = (
-                "Same bar style as SERVICE: [red]red[/red]=paid vs max, "
-                "[green]green[/green]=credits vs max |credit|."
+    if separate_bedrock:
+        console.print(
+            build_bedrock_split_table(
+                bedrock_months,
+                title="Bedrock vs other",
+                caption=(
+                    "[dim]Built from these usage-type lines: positive amounts are usage, "
+                    "negative amounts are credits. Bedrock is every service whose name "
+                    "contains Bedrock. Bedrock net is what you paid; bill that or the "
+                    "gross usage, whichever the client agreement uses.[/dim]"
+                ),
             )
-
-        console.print(table)
+        )
 
     # If region breakdown is requested, add that too
     if show_region:
@@ -1528,8 +1664,9 @@ def _present_simple_account(
     account_label: str | None = None,
     green_style: str = "green",
     red_style: str = "red",
-) -> tuple[float, float, float]:
-    """Print one account's simple report. Returns ``(net, usage, credits)``."""
+    separate_bedrock: bool = False,
+) -> tuple[float, float, float, float]:
+    """Print one account's simple report. Returns ``(net, usage, credits, bedrock_net)``."""
     rt_periods_list = rt_payload.get("ResultsByTime", [])
     rt_by_type = rollup_record_type_totals(rt_periods_list, display_metric)
 
@@ -1563,11 +1700,43 @@ def _present_simple_account(
     grand_total = 0.0
     grand_usage_rt = 0.0
     grand_cred_rt = 0.0
+    bedrock_net_total = 0.0
     monthly_totals = []
 
     cost_periods = cost_data.get("ResultsByTime") or []
     usage_periods = usage_svc_data.get("ResultsByTime", [])
     credit_periods = credit_svc_data.get("ResultsByTime", [])
+
+    if separate_bedrock:
+        bedrock_months: list[tuple[str, bool, float, float, float, float]] = []
+        for period in cost_periods:
+            usage_map = _period_service_amount_map(
+                _find_matching_period(usage_periods, period), display_metric
+            )
+            credit_map = _period_service_amount_map(
+                _find_matching_period(credit_periods, period), display_metric
+            )
+            bedrock_usage, bedrock_credit, other_usage, other_credit = partition_bedrock_maps(
+                usage_map, credit_map
+            )
+            period_start = period["TimePeriod"]["Start"]
+            bedrock_months.append(
+                (
+                    format_date_period(period_start, granularity),
+                    should_show_in_progress(period_start, granularity),
+                    bedrock_usage,
+                    bedrock_credit,
+                    other_usage,
+                    other_credit,
+                )
+            )
+            bedrock_net_total += bedrock_usage + bedrock_credit
+        split_title = "Bedrock vs other"
+        if account_label:
+            split_title = f"Bedrock vs other · {escape(account_label)}"
+        console.print()
+        console.print(build_bedrock_split_table(bedrock_months, title=split_title))
+
     for i, period in enumerate(cost_periods):
         monthly_total = _period_metric_total(period, display_metric)
 
@@ -1595,6 +1764,7 @@ def _present_simple_account(
             account_label=account_label,
             green_style=green_style,
             red_style=red_style,
+            separate_bedrock=separate_bedrock,
         )
         console.print(table)
 
@@ -1648,8 +1818,18 @@ def _present_simple_account(
         reverse=True,
     )
     top_items = sorted_pos[:5]
+    bedrock_usage_total = 0.0
+    if separate_bedrock:
+        bedrock_usage_total = sum(
+            amount
+            for name, amount in item_usage.items()
+            if is_bedrock_service(name) and amount > 0.01
+        )
+        top_items = [
+            (name, amount) for name, amount in sorted_pos if not is_bedrock_service(name)
+        ][:5]
 
-    if insight_denom > 0.01 and top_items:
+    if insight_denom > 0.01 and (top_items or bedrock_usage_total > 0.01):
         console.print("\n[bold]Cost Breakdown Insights:[/bold]")
         denom_s = _format_net_usd(insight_denom)
         console.print(
@@ -1657,6 +1837,12 @@ def _present_simple_account(
         )
 
         pct_basis = "RECORD_TYPE Usage"
+        if bedrock_usage_total > 0.01:
+            percentage = (bedrock_usage_total / insight_denom) * 100
+            console.print(
+                f"• [cyan]Bedrock (billable)[/cyan]: [red]${bedrock_usage_total:.2f}[/red] "
+                f"([bold]{percentage:.1f}%[/bold] of {pct_basis})"
+            )
         for item_name, amount in top_items:
             percentage = (amount / insight_denom) * 100
             console.print(
@@ -1668,7 +1854,7 @@ def _present_simple_account(
             if tip:
                 console.print(f"  [yellow]Tip:[/yellow] {tip}")
 
-    return grand_total, grand_usage_rt, grand_cred_rt
+    return grand_total, grand_usage_rt, grand_cred_rt, bedrock_net_total
 
 
 def _service_maps_to_period(canonical: dict, maps: list[dict[str, float]], metric: str) -> dict:
@@ -1699,6 +1885,7 @@ def _print_combined_multi_account_tables(
     cost_filter_min: float,
     color_legend: str,
     account_labels: list[str] | None = None,
+    separate_bedrock: bool = False,
 ) -> None:
     """
     Service tables and a monthly summary for every linked account at once.
@@ -1723,6 +1910,57 @@ def _print_combined_multi_account_tables(
     )
     if color_legend:
         console.print(color_legend)
+
+    if separate_bedrock:
+        bedrock_months: list[tuple[str, bool, float, float, float, float]] = []
+        for period in anchor:
+            usage_maps = []
+            credit_maps = []
+            for account_id in account_ids:
+                usage_maps.append(
+                    _period_service_amount_map(
+                        _find_matching_period(
+                            (by_usage.get(account_id) or {}).get("ResultsByTime") or [],
+                            period,
+                        ),
+                        display_metric,
+                    )
+                )
+                credit_maps.append(
+                    _period_service_amount_map(
+                        _find_matching_period(
+                            (by_credit.get(account_id) or {}).get("ResultsByTime") or [],
+                            period,
+                        ),
+                        display_metric,
+                    )
+                )
+            usage_map: dict[str, float] = {}
+            credit_map: dict[str, float] = {}
+            for amounts in usage_maps:
+                for name, amount in amounts.items():
+                    usage_map[name] = usage_map.get(name, 0.0) + amount
+            for amounts in credit_maps:
+                for name, amount in amounts.items():
+                    credit_map[name] = credit_map.get(name, 0.0) + amount
+            bedrock_usage, bedrock_credit, other_usage, other_credit = partition_bedrock_maps(
+                usage_map, credit_map
+            )
+            period_start = period["TimePeriod"]["Start"]
+            bedrock_months.append(
+                (
+                    format_date_period(period_start, granularity),
+                    should_show_in_progress(period_start, granularity),
+                    bedrock_usage,
+                    bedrock_credit,
+                    other_usage,
+                    other_credit,
+                )
+            )
+        console.print()
+        console.print(
+            build_bedrock_split_table(bedrock_months, title="Bedrock vs other · all accounts")
+        )
 
     monthly_totals: list[tuple] = []
     account_bars: list[list[tuple]] = []
@@ -1797,6 +2035,7 @@ def _print_combined_multi_account_tables(
                 cost_filter_min=cost_filter_min,
                 account_label="all accounts",
                 service_account_slices=service_account_slices,
+                separate_bedrock=separate_bedrock,
             )
         )
 
@@ -1853,6 +2092,7 @@ def analyze_costs_simple(
     ce_api_dump: list[dict] | None = None,
     out_summary: dict | None = None,
     cost_filter_min: float = 0.0,
+    separate_bedrock: bool = False,
 ) -> None:
     """Simple cost analysis view."""
     console = Console()
@@ -1877,6 +2117,11 @@ def analyze_costs_simple(
             f"{get_account_header_markup()}\n[bold]{title}[/bold]\n{start_date} to {end_date}"
         )
     )
+    if separate_bedrock:
+        console.print(
+            "[dim]Separating Bedrock: services whose name contains Bedrock "
+            "are pulled out so you can bill them to a client.[/dim]"
+        )
 
     # Group by linked account first so one set of calls can be split per account.
     # A single visible account still renders the same report as before.
@@ -2007,6 +2252,7 @@ def analyze_costs_simple(
         "out_summary": out_summary,
         "print_credits": True,
         "print_table_note": True,
+        "separate_bedrock": separate_bedrock,
     }
 
     slices: list[AccountGrandSlice] = []
@@ -2054,7 +2300,9 @@ def analyze_costs_simple(
             present_kwargs["account_label"] = label
             present_kwargs["green_style"] = green_style
             present_kwargs["red_style"] = red_style
-            net, usage_rt, cred_rt = _present_simple_account(console, **present_kwargs)
+            net, usage_rt, cred_rt, bedrock_net = _present_simple_account(
+                console, **present_kwargs
+            )
             slices.append(
                 AccountGrandSlice(
                     account_id=aid,
@@ -2064,6 +2312,7 @@ def analyze_costs_simple(
                     credit=cred_rt,
                     green_style=green_style,
                     red_style=red_style,
+                    bedrock_net=bedrock_net,
                 )
             )
         _print_combined_multi_account_tables(
@@ -2081,10 +2330,17 @@ def analyze_costs_simple(
             cost_filter_min,
             color_legend,
             [format_linked_account_label(aid, names) for aid in account_ids],
+            separate_bedrock,
         )
         console.print()
         console.print(
-            build_accounts_grand_total_table(slices, console.width, start_date, end_date)
+            build_accounts_grand_total_table(
+                slices,
+                console.width,
+                start_date,
+                end_date,
+                separate_bedrock=separate_bedrock,
+            )
         )
 
     if reconcile and verbose:

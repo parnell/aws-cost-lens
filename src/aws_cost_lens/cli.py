@@ -72,6 +72,17 @@ def parse_args():
         help="Show only top N services/usage types (default: 0 for all)",
     )
     parser.add_argument(
+        "--separate-bedrock",
+        action="store_true",
+        help=(
+            "Pull Bedrock out of the rest of the bill. Matches any Cost Explorer "
+            "service whose name contains 'Bedrock' (Amazon Bedrock, AgentCore, and "
+            "marketplace model editions). Those services are listed first with a "
+            "billable subtotal, plus a Bedrock vs other summary. They stay visible "
+            "even when --cost-filter or --top would otherwise fold them in."
+        ),
+    )
+    parser.add_argument(
         "--cost-filter",
         type=float,
         default=0.0,
@@ -258,6 +269,7 @@ def main():
                 verbose=args.verbose,
                 ce_api_dump=ce_api_dump,
                 out_summary=ce_out_summary,
+                separate_bedrock=args.separate_bedrock,
             )
             _write_api_json("detailed")
         else:
@@ -275,6 +287,7 @@ def main():
                 ce_api_dump=ce_api_dump,
                 out_summary=ce_out_summary,
                 cost_filter_min=args.cost_filter,
+                separate_bedrock=args.separate_bedrock,
             )
             _write_api_json("simple")
 

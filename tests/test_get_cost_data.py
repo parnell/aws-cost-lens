@@ -5,7 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aws_cost_lens.core import CE_METRICS_BUNDLE, get_cost_data, normalize_ce_time_period_bound
+from aws_cost_lens.core import (
+    CE_METRICS_BUNDLE,
+    _merge_cost_and_usage_pages,
+    get_cost_data,
+    normalize_ce_time_period_bound,
+)
 from tests.fixtures import load_ce_fixture
 
 
@@ -150,6 +155,65 @@ def test_get_cost_data_paginates_and_merges_groups():
     assert mock_client.get_cost_and_usage.call_count == 2
     second_call = mock_client.get_cost_and_usage.call_args_list[1].kwargs
     assert second_call["NextPageToken"] == page1["NextPageToken"]
+
+
+def test_merge_cost_and_usage_pages_appends_later_days():
+    """A shorter next page is the following days, not more groups on the first days."""
+    page1 = {
+        "GroupDefinitions": [{"Type": "DIMENSION", "Key": "SERVICE"}],
+        "ResultsByTime": [
+            {
+                "TimePeriod": {"Start": "2026-10-01", "End": "2026-10-02"},
+                "Total": {},
+                "Groups": [{"Keys": ["Oct 1"]}],
+            },
+            {
+                "TimePeriod": {"Start": "2026-10-22", "End": "2026-10-23"},
+                "Total": {},
+                "Groups": [{"Keys": ["Oct 22"]}],
+            },
+        ],
+        "NextPageToken": "page-2",
+    }
+    page2 = {
+        "ResultsByTime": [
+            {
+                "TimePeriod": {"Start": "2026-10-23", "End": "2026-10-24"},
+                "Total": {},
+                "Groups": [{"Keys": ["Oct 23"]}],
+            },
+            {
+                "TimePeriod": {"Start": "2026-10-01", "End": "2026-10-02"},
+                "Total": {},
+                "Groups": [{"Keys": ["Oct 1 more"]}],
+                "Estimated": True,
+            },
+            {
+                "TimePeriod": {"Start": "2026-10-29", "End": "2026-10-30"},
+                "Total": {},
+                "Groups": [{"Keys": ["Oct 29"]}],
+                "Estimated": True,
+            },
+        ],
+    }
+
+    merged = _merge_cost_and_usage_pages([page1, page2])
+
+    assert "NextPageToken" not in merged
+    assert [period["TimePeriod"]["Start"] for period in merged["ResultsByTime"]] == [
+        "2026-10-01",
+        "2026-10-22",
+        "2026-10-23",
+        "2026-10-29",
+    ]
+    assert [group["Keys"] for group in merged["ResultsByTime"][0]["Groups"]] == [
+        ["Oct 1"],
+        ["Oct 1 more"],
+    ]
+    assert merged["ResultsByTime"][0]["Estimated"] is True
+    assert [group["Keys"] for group in merged["ResultsByTime"][1]["Groups"]] == [["Oct 22"]]
+    assert [group["Keys"] for group in merged["ResultsByTime"][2]["Groups"]] == [["Oct 23"]]
+    assert page1["ResultsByTime"][0]["Groups"] == [{"Keys": ["Oct 1"]}]
 
 
 def test_resolve_effective_metric_auto_picks_largest_total():

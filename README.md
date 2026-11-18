@@ -28,6 +28,9 @@ aws-cost-lens --list-services
 # Show top 10 most expensive services
 aws-cost-lens --top 10
 
+# Pull Bedrock out of the rest of the bill (client-billable)
+aws-cost-lens --separate-bedrock
+
 # Use a named AWS CLI profile (needs ce:GetCostAndUsage)
 aws-cost-lens --profile billing-admin
 ```
@@ -40,6 +43,7 @@ aws-cost-lens --profile billing-admin
 - `--detailed`: Show detailed breakdown by SERVICE and USAGE_TYPE
 - `--region`: Include region breakdown in detailed analysis
 - `--profile`: AWS named profile (same as `aws --profile`)
+- `--separate-bedrock`: List every Cost Explorer service whose name contains "Bedrock" (Amazon Bedrock, AgentCore, marketplace model editions) ahead of the rest of the bill, with a billable subtotal and a Bedrock vs other summary. Those rows stay visible even when `--cost-filter` or `--top` would otherwise fold them in. Bedrock usage is the gross; Bedrock net is usage plus credits, so you can bill whichever the client agreement uses.
 - `--top N`: Show only top N services/usage types
 - `--granularity`: Time granularity (DAILY, MONTHLY, HOURLY)
 - `--show-all`: Show all items including those with zero costs
